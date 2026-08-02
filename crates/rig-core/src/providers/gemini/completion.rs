@@ -211,6 +211,7 @@ pub(crate) fn create_request_body(
         temperature,
         max_tokens,
         tool_choice,
+        parallel_tool_calls: _,
         mut additional_params,
         output_schema,
     } = completion_request;
@@ -416,6 +417,43 @@ pub(crate) fn function_call_finish_reason_error(
     }
 }
 
+pub(crate) fn terminal_metadata_from_finish_reason(
+    finish_reason: Option<&FinishReason>,
+    has_tool_calls: bool,
+) -> Option<completion::CompletionTerminalMetadata> {
+    let finish_reason = finish_reason?;
+    let reason = match finish_reason {
+        FinishReason::Stop if has_tool_calls => completion::CompletionFinishReason::ToolCalls,
+        FinishReason::Stop => completion::CompletionFinishReason::Stop,
+        FinishReason::MaxTokens => completion::CompletionFinishReason::Length,
+        FinishReason::Safety
+        | FinishReason::Recitation
+        | FinishReason::Language
+        | FinishReason::Blocklist
+        | FinishReason::ProhibitedContent
+        | FinishReason::Spii
+        | FinishReason::ImageSafety
+        | FinishReason::ImageProhibitedContent
+        | FinishReason::ImageRecitation
+        | FinishReason::Escalation => completion::CompletionFinishReason::ContentFilter,
+        FinishReason::FinishReasonUnspecified
+        | FinishReason::Other
+        | FinishReason::ImageOther
+        | FinishReason::NoImage
+        | FinishReason::MalformedFunctionCall
+        | FinishReason::UnexpectedToolCall
+        | FinishReason::MissingThoughtSignature
+        | FinishReason::TooManyToolCalls
+        | FinishReason::MalformedResponse
+        | FinishReason::Unknown(_) => completion::CompletionFinishReason::Unknown,
+    };
+
+    Some(
+        completion::CompletionTerminalMetadata::new(reason)
+            .with_raw_reason(finish_reason.as_raw_reason()),
+    )
+}
+
 impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<GenerateContentResponse> {
     type Error = CompletionError;
 
@@ -430,6 +468,14 @@ impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<Generat
         {
             return Err(err);
         }
+        let has_tool_calls = candidate.content.as_ref().is_some_and(|content| {
+            content
+                .parts
+                .iter()
+                .any(|part| matches!(&part.part, PartKind::FunctionCall(_)))
+        });
+        let terminal_metadata =
+            terminal_metadata_from_finish_reason(candidate.finish_reason.as_ref(), has_tool_calls);
 
         let content = candidate
             .content
@@ -527,6 +573,7 @@ impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<Generat
             usage,
             raw_response: response,
             message_id: None,
+            terminal_metadata,
         })
     }
 }
@@ -1409,12 +1456,17 @@ pub mod gemini_api_types {
             let mut usage = crate::completion::Usage::new();
 
             usage.input_tokens = self.prompt_token_count as u64;
-            usage.output_tokens = self.candidates_token_count.unwrap_or_default() as u64;
             usage.cached_input_tokens = self.cached_content_token_count.unwrap_or_default() as u64;
             usage.reasoning_tokens = self.thoughts_token_count.unwrap_or_default() as u64;
+            usage.output_tokens =
+                self.candidates_token_count.unwrap_or_default() as u64 + usage.reasoning_tokens;
             usage.tool_use_prompt_tokens =
                 self.tool_use_prompt_token_count.unwrap_or_default() as u64;
-            usage.total_tokens = self.total_token_count as u64;
+            usage.total_tokens = if self.total_token_count == 0 {
+                usage.input_tokens + usage.output_tokens
+            } else {
+                self.total_token_count as u64
+            };
 
             usage
         }
@@ -1446,8 +1498,7 @@ pub mod gemini_api_types {
         ProhibitedContent,
     }
 
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    #[derive(Clone, Debug)]
     pub enum FinishReason {
         /// Default value. This value is unused.
         FinishReasonUnspecified,
@@ -1479,6 +1530,90 @@ pub mod gemini_api_types {
         TooManyToolCalls,
         /// The provider could not parse the generated response into a valid protocol shape.
         MalformedResponse,
+        /// Generated image content was flagged for safety reasons.
+        ImageSafety,
+        /// Generated image content was flagged as prohibited content.
+        ImageProhibitedContent,
+        /// Generated image content stopped for another image-specific reason.
+        ImageOther,
+        /// The model did not generate an image.
+        NoImage,
+        /// Generated image content was flagged for recitation.
+        ImageRecitation,
+        /// The response was escalated for additional review.
+        Escalation,
+        /// A provider value introduced after this Rig version.
+        Unknown(String),
+    }
+
+    impl FinishReason {
+        pub(crate) fn as_raw_reason(&self) -> &str {
+            match self {
+                Self::FinishReasonUnspecified => "FINISH_REASON_UNSPECIFIED",
+                Self::Stop => "STOP",
+                Self::MaxTokens => "MAX_TOKENS",
+                Self::Safety => "SAFETY",
+                Self::Recitation => "RECITATION",
+                Self::Language => "LANGUAGE",
+                Self::Other => "OTHER",
+                Self::Blocklist => "BLOCKLIST",
+                Self::ProhibitedContent => "PROHIBITED_CONTENT",
+                Self::Spii => "SPII",
+                Self::MalformedFunctionCall => "MALFORMED_FUNCTION_CALL",
+                Self::UnexpectedToolCall => "UNEXPECTED_TOOL_CALL",
+                Self::MissingThoughtSignature => "MISSING_THOUGHT_SIGNATURE",
+                Self::TooManyToolCalls => "TOO_MANY_TOOL_CALLS",
+                Self::MalformedResponse => "MALFORMED_RESPONSE",
+                Self::ImageSafety => "IMAGE_SAFETY",
+                Self::ImageProhibitedContent => "IMAGE_PROHIBITED_CONTENT",
+                Self::ImageOther => "IMAGE_OTHER",
+                Self::NoImage => "NO_IMAGE",
+                Self::ImageRecitation => "IMAGE_RECITATION",
+                Self::Escalation => "ESCALATION",
+                Self::Unknown(reason) => reason,
+            }
+        }
+    }
+
+    impl Serialize for FinishReason {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(self.as_raw_reason())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for FinishReason {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Ok(match String::deserialize(deserializer)?.as_str() {
+                "FINISH_REASON_UNSPECIFIED" => Self::FinishReasonUnspecified,
+                "STOP" => Self::Stop,
+                "MAX_TOKENS" => Self::MaxTokens,
+                "SAFETY" => Self::Safety,
+                "RECITATION" => Self::Recitation,
+                "LANGUAGE" => Self::Language,
+                "OTHER" => Self::Other,
+                "BLOCKLIST" => Self::Blocklist,
+                "PROHIBITED_CONTENT" => Self::ProhibitedContent,
+                "SPII" => Self::Spii,
+                "MALFORMED_FUNCTION_CALL" => Self::MalformedFunctionCall,
+                "UNEXPECTED_TOOL_CALL" => Self::UnexpectedToolCall,
+                "MISSING_THOUGHT_SIGNATURE" => Self::MissingThoughtSignature,
+                "TOO_MANY_TOOL_CALLS" => Self::TooManyToolCalls,
+                "MALFORMED_RESPONSE" => Self::MalformedResponse,
+                "IMAGE_SAFETY" => Self::ImageSafety,
+                "IMAGE_PROHIBITED_CONTENT" => Self::ImageProhibitedContent,
+                "IMAGE_OTHER" => Self::ImageOther,
+                "NO_IMAGE" => Self::NoImage,
+                "IMAGE_RECITATION" => Self::ImageRecitation,
+                "ESCALATION" => Self::Escalation,
+                reason => Self::Unknown(reason.to_owned()),
+            })
+        }
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2196,6 +2331,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -2223,6 +2359,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -2449,6 +2586,136 @@ mod tests {
     }
 
     #[test]
+    fn finish_reasons_map_to_terminal_metadata_and_preserve_raw_values() {
+        for (reason, expected, raw) in [
+            (
+                FinishReason::Stop,
+                completion::CompletionFinishReason::Stop,
+                "STOP",
+            ),
+            (
+                FinishReason::MaxTokens,
+                completion::CompletionFinishReason::Length,
+                "MAX_TOKENS",
+            ),
+            (
+                FinishReason::Safety,
+                completion::CompletionFinishReason::ContentFilter,
+                "SAFETY",
+            ),
+            (
+                FinishReason::ImageProhibitedContent,
+                completion::CompletionFinishReason::ContentFilter,
+                "IMAGE_PROHIBITED_CONTENT",
+            ),
+            (
+                FinishReason::ImageSafety,
+                completion::CompletionFinishReason::ContentFilter,
+                "IMAGE_SAFETY",
+            ),
+            (
+                FinishReason::ImageRecitation,
+                completion::CompletionFinishReason::ContentFilter,
+                "IMAGE_RECITATION",
+            ),
+            (
+                FinishReason::Escalation,
+                completion::CompletionFinishReason::ContentFilter,
+                "ESCALATION",
+            ),
+            (
+                FinishReason::ImageOther,
+                completion::CompletionFinishReason::Unknown,
+                "IMAGE_OTHER",
+            ),
+            (
+                FinishReason::NoImage,
+                completion::CompletionFinishReason::Unknown,
+                "NO_IMAGE",
+            ),
+            (
+                FinishReason::Other,
+                completion::CompletionFinishReason::Unknown,
+                "OTHER",
+            ),
+        ] {
+            let metadata = terminal_metadata_from_finish_reason(Some(&reason), false)
+                .expect("supplied finish reason should produce metadata");
+            assert_eq!(metadata.reason(), expected);
+            assert_eq!(metadata.raw_reason(), Some(raw));
+        }
+
+        for raw in [
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_OTHER",
+            "NO_IMAGE",
+            "IMAGE_RECITATION",
+            "ESCALATION",
+        ] {
+            let reason: FinishReason = serde_json::from_value(json!(raw))
+                .expect("documented image finish reason should deserialize");
+            assert_eq!(reason.as_raw_reason(), raw);
+        }
+
+        let unknown: FinishReason = serde_json::from_str(r#""FUTURE_REASON""#)
+            .expect("unknown finish reason should deserialize");
+        let metadata = terminal_metadata_from_finish_reason(Some(&unknown), false)
+            .expect("unknown finish reason should produce metadata");
+        assert_eq!(
+            metadata.reason(),
+            completion::CompletionFinishReason::Unknown
+        );
+        assert_eq!(metadata.raw_reason(), Some("FUTURE_REASON"));
+        assert_eq!(terminal_metadata_from_finish_reason(None, false), None);
+    }
+
+    #[test]
+    fn stop_with_function_call_normalizes_to_tool_calls() {
+        let response = GenerateContentResponse {
+            response_id: "resp_tool_call".to_string(),
+            candidates: vec![ContentCandidate {
+                content: Some(Content {
+                    parts: vec![Part {
+                        thought: None,
+                        thought_signature: None,
+                        part: PartKind::FunctionCall(FunctionCall {
+                            name: "lookup".to_string(),
+                            args: json!({"query": "rust"}),
+                        }),
+                        additional_params: None,
+                    }],
+                    role: Some(Role::Model),
+                }),
+                finish_reason: Some(FinishReason::Stop),
+                safety_ratings: None,
+                citation_metadata: None,
+                token_count: None,
+                avg_logprobs: None,
+                logprobs_result: None,
+                index: Some(0),
+                finish_message: None,
+            }],
+            prompt_feedback: None,
+            usage_metadata: None,
+            model_version: None,
+        };
+
+        let converted: completion::CompletionResponse<GenerateContentResponse> = response
+            .try_into()
+            .expect("tool-call response should convert");
+        let terminal = converted
+            .terminal_metadata
+            .expect("finish reason should produce terminal metadata");
+
+        assert_eq!(
+            terminal.reason(),
+            completion::CompletionFinishReason::ToolCalls
+        );
+        assert_eq!(terminal.raw_reason(), Some("STOP"));
+    }
+
+    #[test]
     fn test_tool_protocol_finish_reason_returns_response_error() {
         for (reason, finish_message) in [
             (
@@ -2544,7 +2811,7 @@ mod tests {
                 prompt_token_count: 40,
                 cached_content_token_count: Some(20),
                 candidates_token_count: Some(30),
-                total_token_count: 100,
+                total_token_count: 0,
                 thoughts_token_count: Some(10),
                 prompt_tokens_details: None,
                 cache_tokens_details: None,
@@ -2561,10 +2828,10 @@ mod tests {
 
         assert_eq!(converted.usage.input_tokens, 40);
         assert_eq!(converted.usage.cached_input_tokens, 20);
-        assert_eq!(converted.usage.output_tokens, 30);
+        assert_eq!(converted.usage.output_tokens, 40);
         assert_eq!(converted.usage.reasoning_tokens, 10);
         assert_eq!(converted.usage.tool_use_prompt_tokens, 12);
-        assert_eq!(converted.usage.total_tokens, 100);
+        assert_eq!(converted.usage.total_tokens, 80);
     }
 
     #[test]
@@ -3061,6 +3328,7 @@ mod tests {
             output_schema: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
         }
         .normalized_documents()
@@ -3080,6 +3348,7 @@ mod tests {
             output_schema: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
         };
 
@@ -3144,6 +3413,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             model: None,
             output_schema: None,
             additional_params: None,

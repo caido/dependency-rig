@@ -619,6 +619,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             usage,
             raw_response: response,
             message_id: None,
+            terminal_metadata: None,
         })
     }
 }
@@ -846,6 +847,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -868,6 +870,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1327,6 +1330,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             model: None,
             output_schema: None,

@@ -402,23 +402,87 @@ impl ToolDefinition {
     }
 }
 
-#[derive(Default, Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Default, Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ToolChoice {
     #[default]
     Auto,
     None,
     Required,
+    /// Force the model to call one specific function.
+    Function {
+        name: String,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+struct ToolChoiceFunctionName {
+    name: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ToolChoiceFunctionRepr {
+    Function { function: ToolChoiceFunctionName },
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::None => serializer.serialize_str("none"),
+            Self::Required => serializer.serialize_str("required"),
+            Self::Function { name } => ToolChoiceFunctionRepr::Function {
+                function: ToolChoiceFunctionName { name: name.clone() },
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Mode(String),
+            Function(ToolChoiceFunctionRepr),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Mode(mode) => match mode.as_str() {
+                "auto" => Ok(Self::Auto),
+                "none" => Ok(Self::None),
+                "required" => Ok(Self::Required),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown tool_choice mode {other:?}"
+                ))),
+            },
+            Repr::Function(ToolChoiceFunctionRepr::Function {
+                function: ToolChoiceFunctionName { name },
+            }) => Ok(Self::Function { name }),
+        }
+    }
+}
+
+impl ToolChoice {
+    /// Force a call to the named function.
+    pub fn function(name: impl Into<String>) -> Self {
+        Self::Function { name: name.into() }
+    }
 }
 
 impl TryFrom<crate::message::ToolChoice> for ToolChoice {
     type Error = CompletionError;
     fn try_from(value: crate::message::ToolChoice) -> Result<Self, Self::Error> {
         let res = match value {
-            message::ToolChoice::Specific { .. } => {
-                return Err(CompletionError::ProviderError(
-                    "Provider doesn't support only using specific tools".to_string(),
-                ));
+            message::ToolChoice::Specific { function_names } => {
+                let [name] = function_names.as_slice() else {
+                    return Err(CompletionError::RequestError(
+                        "OpenAI Chat Completions requires exactly one specific tool".into(),
+                    ));
+                };
+                Self::function(name)
             }
             message::ToolChoice::Auto => Self::Auto,
             message::ToolChoice::None => Self::None,
@@ -901,6 +965,8 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
         let choice = response.choices.first().ok_or_else(|| {
             CompletionError::ResponseError("Response contained no choices".to_owned())
         })?;
+        let terminal_metadata =
+            terminal_metadata_from_finish_reason(Some(choice.finish_reason.as_str()));
 
         let content = match &choice.message {
             Message::Assistant {
@@ -950,28 +1016,29 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             )),
         }?;
 
-        let choice = OneOrMany::many(content).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
+        let allows_empty_choice = terminal_metadata.as_ref().is_some_and(|metadata| {
+            matches!(
+                metadata.reason(),
+                completion::CompletionFinishReason::Length
+                    | completion::CompletionFinishReason::ContentFilter
             )
-        })?;
+        });
+        let choice = match OneOrMany::many(content) {
+            Ok(choice) => choice,
+            Err(_) if allows_empty_choice => {
+                OneOrMany::one(completion::AssistantContent::text(String::new()))
+            }
+            Err(_) => {
+                return Err(CompletionError::ResponseError(
+                    "Response contained no message or tool call (empty)".to_owned(),
+                ));
+            }
+        };
 
         let usage = response
             .usage
             .as_ref()
-            .map(|usage| completion::Usage {
-                input_tokens: usage.prompt_tokens as u64,
-                output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
-                total_tokens: usage.total_tokens as u64,
-                cached_input_tokens: usage
-                    .prompt_tokens_details
-                    .as_ref()
-                    .map(|d| d.cached_tokens as u64)
-                    .unwrap_or(0),
-                cache_creation_input_tokens: 0,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            })
+            .map(GetTokenUsage::token_usage)
             .unwrap_or_default();
 
         Ok(completion::CompletionResponse {
@@ -979,8 +1046,24 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             usage,
             raw_response: response,
             message_id: None,
+            terminal_metadata,
         })
     }
+}
+
+pub(crate) fn terminal_metadata_from_finish_reason(
+    raw_reason: Option<&str>,
+) -> Option<completion::CompletionTerminalMetadata> {
+    let raw_reason = raw_reason?;
+    let reason = match raw_reason {
+        "stop" => completion::CompletionFinishReason::Stop,
+        "length" => completion::CompletionFinishReason::Length,
+        "tool_calls" | "function_call" => completion::CompletionFinishReason::ToolCalls,
+        "content_filter" => completion::CompletionFinishReason::ContentFilter,
+        _ => completion::CompletionFinishReason::Unknown,
+    };
+
+    Some(completion::CompletionTerminalMetadata::new(reason).with_raw_reason(raw_reason))
 }
 
 impl ProviderResponseExt for CompletionResponse {
@@ -1063,12 +1146,21 @@ pub struct PromptTokensDetails {
     pub cached_tokens: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct CompletionTokensDetails {
+    /// Tokens spent on internal reasoning.
+    #[serde(default)]
+    pub reasoning_tokens: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub total_tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 impl Usage {
@@ -1077,6 +1169,7 @@ impl Usage {
             prompt_tokens: 0,
             total_tokens: 0,
             prompt_tokens_details: None,
+            completion_tokens_details: None,
         }
     }
 }
@@ -1103,15 +1196,21 @@ impl fmt::Display for Usage {
 
 impl GetTokenUsage for Usage {
     fn token_usage(&self) -> crate::completion::Usage {
-        crate::providers::internal::completion_usage(
+        let mut usage = crate::providers::internal::completion_usage(
             self.prompt_tokens as u64,
-            (self.total_tokens - self.prompt_tokens) as u64,
+            self.total_tokens.saturating_sub(self.prompt_tokens) as u64,
             self.total_tokens as u64,
             self.prompt_tokens_details
                 .as_ref()
                 .map(|d| d.cached_tokens as u64)
                 .unwrap_or(0),
-        )
+        );
+        usage.reasoning_tokens = self
+            .completion_tokens_details
+            .as_ref()
+            .map(|details| details.reasoning_tokens as u64)
+            .unwrap_or(0);
+        usage
     }
 }
 
@@ -1182,6 +1281,8 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
@@ -1217,6 +1318,7 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
             max_tokens,
             additional_params,
             tool_choice,
+            parallel_tool_calls,
             output_schema,
             ..
         } = req;
@@ -1308,6 +1410,7 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
             messages: full_history,
             tools,
             tool_choice,
+            parallel_tool_calls,
             temperature,
             max_tokens,
             additional_params,
@@ -1478,10 +1581,185 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::completion::CompletionRequestBuilder;
+    use crate::completion::{CompletionFinishReason, CompletionRequestBuilder};
     use crate::telemetry::ProviderResponseExt;
     use crate::test_utils::MockCompletionModel;
     use std::collections::HashMap;
+
+    #[test]
+    fn finish_reason_normalization_preserves_known_and_unknown_values() {
+        for (raw, expected) in [
+            ("stop", CompletionFinishReason::Stop),
+            ("length", CompletionFinishReason::Length),
+            ("tool_calls", CompletionFinishReason::ToolCalls),
+            ("function_call", CompletionFinishReason::ToolCalls),
+            ("content_filter", CompletionFinishReason::ContentFilter),
+            ("future_reason", CompletionFinishReason::Unknown),
+        ] {
+            let metadata = terminal_metadata_from_finish_reason(Some(raw))
+                .expect("supplied reason should produce metadata");
+            assert_eq!(metadata.reason(), expected);
+            assert_eq!(metadata.raw_reason(), Some(raw));
+        }
+
+        assert_eq!(terminal_metadata_from_finish_reason(None), None);
+    }
+
+    #[test]
+    fn chat_response_preserves_terminal_reason_and_reasoning_usage() {
+        let response: CompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl_123",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-test",
+            "system_fingerprint": null,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "partial" },
+                "logprobs": null,
+                "finish_reason": "length"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 12,
+                "total_tokens": 22,
+                "completion_tokens_details": { "reasoning_tokens": 7 }
+            }
+        }))
+        .expect("response fixture should deserialize");
+
+        let converted: completion::CompletionResponse<CompletionResponse> = response
+            .try_into()
+            .expect("response fixture should convert");
+        let metadata = converted
+            .terminal_metadata
+            .expect("finish reason should be normalized");
+
+        assert_eq!(metadata.reason(), CompletionFinishReason::Length);
+        assert_eq!(metadata.raw_reason(), Some("length"));
+        assert_eq!(converted.usage.output_tokens, 12);
+        assert_eq!(converted.usage.reasoning_tokens, 7);
+    }
+
+    #[test]
+    fn empty_content_filtered_response_preserves_terminal_metadata() {
+        let response: CompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl_filtered",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-test",
+            "system_fingerprint": null,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "" },
+                "logprobs": null,
+                "finish_reason": "content_filter"
+            }],
+            "usage": null
+        }))
+        .expect("response fixture should deserialize");
+
+        let converted: completion::CompletionResponse<CompletionResponse> = response
+            .try_into()
+            .expect("filtered response should retain terminal metadata");
+        let metadata = converted
+            .terminal_metadata
+            .expect("finish reason should be normalized");
+
+        assert_eq!(metadata.reason(), CompletionFinishReason::ContentFilter);
+        assert_eq!(metadata.raw_reason(), Some("content_filter"));
+        assert!(matches!(
+            converted.choice.first(),
+            completion::AssistantContent::Text(message::Text { text, .. }) if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn chat_usage_without_reasoning_details_defaults_to_zero() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "total_tokens": 13
+        }))
+        .expect("usage fixture should deserialize");
+
+        assert_eq!(usage.token_usage().reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn chat_tool_choice_modes_serialize_as_plain_strings() {
+        for (choice, expected) in [
+            (message::ToolChoice::Auto, serde_json::json!("auto")),
+            (message::ToolChoice::None, serde_json::json!("none")),
+            (message::ToolChoice::Required, serde_json::json!("required")),
+        ] {
+            let converted = ToolChoice::try_from(choice).expect("mode should convert");
+            assert_eq!(
+                serde_json::to_value(&converted).expect("serialize tool choice"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn chat_tool_choice_specific_serializes_as_named_function() {
+        let converted = ToolChoice::try_from(message::ToolChoice::Specific {
+            function_names: vec!["get_weather".to_string()],
+        })
+        .expect("single specific tool should convert");
+
+        assert_eq!(
+            serde_json::to_value(&converted).expect("serialize tool choice"),
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": "get_weather" }
+            })
+        );
+    }
+
+    #[test]
+    fn chat_tool_choice_specific_requires_exactly_one_name() {
+        for function_names in [
+            Vec::new(),
+            vec!["get_weather".to_string(), "get_time".to_string()],
+        ] {
+            let converted = ToolChoice::try_from(message::ToolChoice::Specific { function_names });
+
+            assert!(matches!(
+                converted,
+                Err(CompletionError::RequestError(error))
+                    if error.to_string().contains("exactly one specific tool")
+            ));
+        }
+    }
+
+    #[test]
+    fn chat_request_serializes_named_tool_choice_and_parallel_control() {
+        let request = CompletionRequestBuilder::new(MockCompletionModel::default(), "weather")
+            .tool(completion::ToolDefinition {
+                name: "get_weather".to_string(),
+                description: "Get weather".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            })
+            .tool_choice(message::ToolChoice::Specific {
+                function_names: vec!["get_weather".to_string()],
+            })
+            .parallel_tool_calls(false)
+            .build();
+
+        let request = CompletionRequest::try_from(("gpt-test".to_string(), request))
+            .expect("request should convert");
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(
+            json["tool_choice"],
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": "get_weather" }
+            })
+        );
+        assert_eq!(json["parallel_tool_calls"], false);
+    }
 
     fn test_document(id: &str, text: &str) -> crate::completion::Document {
         crate::completion::Document {
@@ -1502,6 +1780,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1530,6 +1809,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1611,6 +1891,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1812,6 +2093,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(4096),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1840,6 +2122,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1871,6 +2154,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1908,6 +2192,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: Some(
                 serde_json::from_value(serde_json::json!({
@@ -1976,6 +2261,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: Some(
                 serde_json::from_value(serde_json::json!({

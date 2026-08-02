@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{Level, enabled, info_span};
 
-use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
+use crate::completion::{
+    CompletionError, CompletionRequest, CompletionTerminalMetadata, GetTokenUsage,
+};
 use crate::http_client::HttpClientExt;
 use crate::json_utils::{self, merge};
 use crate::providers::internal::openai_chat_completions_compatible::{
@@ -66,6 +68,18 @@ pub enum FinishReason {
     Other(String), // This will handle the deprecated function_call
 }
 
+impl FinishReason {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::ToolCalls => "tool_calls",
+            Self::Stop => "stop",
+            Self::ContentFilter => "content_filter",
+            Self::Length => "length",
+            Self::Other(reason) => reason,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct StreamingChoice {
     delta: StreamingDelta,
@@ -83,11 +97,17 @@ struct StreamingCompletionChunk {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StreamingCompletionResponse {
     pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> crate::completion::Usage {
         self.usage.token_usage()
+    }
+
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.terminal_metadata.clone()
     }
 }
 
@@ -168,13 +188,7 @@ impl CompatibleStreamProfile for OpenAICompatibleProfile {
         &self,
         data: &str,
     ) -> Result<Option<CompatibleChunk<Self::Usage, Self::Detail>>, CompletionError> {
-        let data = match serde_json::from_str::<StreamingCompletionChunk>(data) {
-            Ok(data) => data,
-            Err(error) => {
-                tracing::error!(?error, message = data, "Failed to parse SSE message");
-                return Ok(None);
-            }
-        };
+        let data = serde_json::from_str::<StreamingCompletionChunk>(data)?;
 
         Ok(Some(
             openai_chat_completions_compatible::normalize_first_choice_chunk(
@@ -183,11 +197,14 @@ impl CompatibleStreamProfile for OpenAICompatibleProfile {
                 data.usage,
                 &data.choices,
                 |choice| CompatibleChoiceData {
-                    finish_reason: if choice.finish_reason == Some(FinishReason::ToolCalls) {
-                        CompatibleFinishReason::ToolCalls
-                    } else {
-                        CompatibleFinishReason::Other
-                    },
+                    finish_reason: choice
+                        .finish_reason
+                        .as_ref()
+                        .and_then(|reason| {
+                            super::terminal_metadata_from_finish_reason(Some(reason.as_str()))
+                        })
+                        .map(CompatibleFinishReason::Terminal)
+                        .unwrap_or(CompatibleFinishReason::Other),
                     text: choice.delta.content.clone(),
                     reasoning: choice.delta.reasoning_content.clone(),
                     tool_calls: openai_chat_completions_compatible::tool_call_chunks(
@@ -200,7 +217,25 @@ impl CompatibleStreamProfile for OpenAICompatibleProfile {
     }
 
     fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse {
-        StreamingCompletionResponse { usage }
+        StreamingCompletionResponse {
+            usage,
+            terminal_metadata: None,
+        }
+    }
+
+    fn build_final_response_with_terminal_metadata(
+        &self,
+        usage: Self::Usage,
+        terminal_metadata: Option<CompletionTerminalMetadata>,
+    ) -> Self::FinalResponse {
+        StreamingCompletionResponse {
+            usage,
+            terminal_metadata,
+        }
+    }
+
+    fn requires_terminal_metadata(&self) -> bool {
+        true
     }
 
     fn uses_distinct_tool_call_eviction(&self) -> bool {
@@ -469,15 +504,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_streaming_usage_only_chunk_is_not_ignored() {
+    async fn terminal_chunk_and_usage_only_chunk_populate_final_response() {
         use crate::test_utils::MockStreamingClient;
         use futures::StreamExt;
 
         // Some providers emit a final "usage-only" chunk where `choices` is empty.
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines([
-                "{\"choices\":[{\"delta\":{\"content\":\"Hello\",\"tool_calls\":[]}}],\"usage\":null}",
-                "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}",
+                "{\"choices\":[{\"delta\":{\"content\":\"Hello\",\"tool_calls\":[]},\"finish_reason\":\"length\"}],\"usage\":null}",
+                "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"completion_tokens_details\":{\"reasoning_tokens\":3}}}",
                 "[DONE]",
             ]),
         };
@@ -492,17 +527,27 @@ mod tests {
             .await
             .unwrap();
 
-        let mut final_usage = None;
+        let mut final_response = None;
         while let Some(chunk) = stream.next().await {
             if let streaming::StreamedAssistantContent::Final(res) = chunk.unwrap() {
-                final_usage = Some(res.usage);
+                final_response = Some(res);
                 break;
             }
         }
 
-        let usage = final_usage.expect("expected a final response with usage");
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.total_tokens, 15);
+        let response = final_response.expect("expected a final response with usage");
+        let metadata = response
+            .terminal_metadata
+            .as_ref()
+            .expect("terminal finish reason should be preserved");
+        assert_eq!(
+            metadata.reason(),
+            crate::completion::CompletionFinishReason::Length
+        );
+        assert_eq!(metadata.raw_reason(), Some("length"));
+        assert_eq!(response.usage.prompt_tokens, 10);
+        assert_eq!(response.usage.total_tokens, 15);
+        assert_eq!(response.token_usage().reasoning_tokens, 3);
     }
 
     #[tokio::test]
@@ -569,7 +614,7 @@ mod tests {
         // Usage chunk includes prompt_tokens_details with cached_tokens.
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines([
-                "{\"choices\":[{\"delta\":{\"content\":\"Hi\",\"tool_calls\":[]}}],\"usage\":null}",
+                "{\"choices\":[{\"delta\":{\"content\":\"Hi\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":null}",
                 "{\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110,\"prompt_tokens_details\":{\"cached_tokens\":80}}}",
                 "[DONE]",
             ]),
@@ -815,8 +860,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_zero_arg_tool_call_is_preserved_at_eof() {
+    async fn truncated_stream_without_finish_reason_returns_response_error() {
         use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
 
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines([
@@ -830,10 +876,55 @@ mod tests {
             .body(Vec::new())
             .unwrap();
 
-        let stream = send_compatible_streaming_request(client, req)
+        let mut stream = send_compatible_streaming_request(client, req)
             .await
             .unwrap();
 
-        assert_zero_arg_tool_call_is_emitted(stream, "call_123", "ping", true).await;
+        let error = loop {
+            match stream.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => continue,
+                None => panic!("truncated stream should return an error"),
+            }
+        };
+
+        assert!(matches!(error, CompletionError::ResponseError(_)));
+        assert!(error.to_string().contains("terminal finish reason"));
+        assert!(stream.response.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_chat_chunk_returns_json_error_without_final_response() {
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                "{\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":null}",
+                "[DONE]",
+            ]),
+        };
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .unwrap();
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .unwrap();
+
+        let error = loop {
+            match stream.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(streaming::StreamedAssistantContent::Final(_))) => {
+                    panic!("malformed stream must not yield a final response")
+                }
+                Some(Ok(_)) => continue,
+                None => panic!("malformed stream should return an error"),
+            }
+        };
+
+        assert!(matches!(error, CompletionError::JsonError(_)));
+        assert!(stream.response.is_none());
     }
 }

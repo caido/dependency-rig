@@ -33,6 +33,14 @@ async fn streaming() {
 
         let stats = reasoning::collect_stream_stats(stream, "openrouter").await;
         reasoning::assert_universal(&stats, &call_count, "openrouter");
+        assert!(
+            stats.reasoning_block_count > 0,
+            "openrouter stream should surface typed reasoning_details blocks"
+        );
+        assert!(
+            stats.reasoning_has_encrypted,
+            "openrouter stream should preserve encrypted reasoning_details for replay"
+        );
     })
     .await;
 }

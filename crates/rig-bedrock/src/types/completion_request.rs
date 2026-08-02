@@ -250,6 +250,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         }

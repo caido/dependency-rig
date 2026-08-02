@@ -281,6 +281,7 @@ where
     pub(crate) tool_extensions: ToolCallExtensions,
     pub(crate) dynamic_context: DynamicContextStore,
     pub(crate) tool_choice: Option<ToolChoice>,
+    pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) output_schema: Option<schemars::Schema>,
     pub(crate) output_mode: OutputMode,
     pub(crate) concurrency: usize,
@@ -312,6 +313,7 @@ where
             tool_extensions: ToolCallExtensions::new(),
             dynamic_context: agent.dynamic_context.clone(),
             tool_choice: agent.tool_choice.clone(),
+            parallel_tool_calls: agent.parallel_tool_calls,
             output_schema: agent.output_schema.clone(),
             output_mode: agent.output_mode.clone(),
             concurrency: 1,
@@ -387,6 +389,12 @@ where
     /// sequentially (the `buffer_unordered` path is used only at `concurrency > 1`).
     pub fn tool_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Set whether the model provider may emit multiple tool calls in one turn.
+    pub fn parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
+        self.parallel_tool_calls = Some(parallel_tool_calls);
         self
     }
 

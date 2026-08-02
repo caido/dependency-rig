@@ -7,7 +7,7 @@ use tracing_futures::Instrument;
 
 use super::completion::{
     AnthropicCompatibleProvider, AnthropicCompletionRequest, AnthropicRequestParams, CacheTtl,
-    Content, GenericCompletionModel, Usage,
+    Content, GenericCompletionModel, Usage, terminal_metadata_from_stop_reason,
 };
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
 use crate::http_client::sse::{Event, GenericEventSource};
@@ -160,14 +160,13 @@ impl GetTokenUsage for PartialUsage {
     fn token_usage(&self) -> crate::completion::Usage {
         let mut usage = crate::completion::Usage::new();
 
-        usage.input_tokens = self.input_tokens.unwrap_or_default() as u64;
-        usage.output_tokens = self.output_tokens as u64;
         usage.cached_input_tokens = self.cache_read_input_tokens.unwrap_or(0);
         usage.cache_creation_input_tokens = self.cache_creation_input_tokens.unwrap_or(0);
-        usage.total_tokens = usage.input_tokens
+        usage.input_tokens = self.input_tokens.unwrap_or_default() as u64
             + usage.cached_input_tokens
-            + usage.cache_creation_input_tokens
-            + usage.output_tokens;
+            + usage.cache_creation_input_tokens;
+        usage.output_tokens = self.output_tokens as u64;
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
         usage
     }
 }
@@ -196,21 +195,17 @@ struct ThinkingState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StreamingCompletionResponse {
     pub usage: PartialUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> crate::completion::Usage {
-        let mut usage = crate::completion::Usage::new();
-        usage.input_tokens = self.usage.input_tokens.unwrap_or(0) as u64;
-        usage.output_tokens = self.usage.output_tokens as u64;
-        usage.cached_input_tokens = self.usage.cache_read_input_tokens.unwrap_or(0);
-        usage.cache_creation_input_tokens = self.usage.cache_creation_input_tokens.unwrap_or(0);
-        usage.total_tokens = usage.input_tokens
-            + usage.cached_input_tokens
-            + usage.cache_creation_input_tokens
-            + usage.output_tokens;
+        self.usage.token_usage()
+    }
 
-        usage
+    fn terminal_metadata(&self) -> Option<crate::completion::CompletionTerminalMetadata> {
+        terminal_metadata_from_stop_reason(self.stop_reason.as_deref())
     }
 }
 
@@ -292,7 +287,12 @@ where
             let mut current_thinking: Option<ThinkingState> = None;
             let mut sse_stream = Box::pin(stream);
             let mut input_tokens = 0;
+            let mut cache_creation_input_tokens = None;
+            let mut cache_read_input_tokens = None;
             let mut final_usage = None;
+            let mut final_stop_reason = None;
+            let mut saw_message_stop = false;
+            let mut stream_failed = false;
 
             let mut text_content = String::new();
 
@@ -300,34 +300,46 @@ where
                 match sse_result {
                     Ok(Event::Open) => {}
                     Ok(Event::Message(sse)) => {
+                        if sse.data == "[DONE]" {
+                            break;
+                        }
+
                         // Parse the SSE data as a StreamingEvent
                         match serde_json::from_str::<StreamingEvent>(&sse.data) {
                             Ok(event) => {
                                 match &event {
                                     StreamingEvent::MessageStart { message } => {
                                         input_tokens = message.usage.input_tokens;
+                                        cache_creation_input_tokens =
+                                            message.usage.cache_creation_input_tokens;
+                                        cache_read_input_tokens =
+                                            message.usage.cache_read_input_tokens;
 
                                         let span = tracing::Span::current();
                                         span.record("gen_ai.response.id", &message.id);
                                         span.record("gen_ai.response.model", &message.model);
                                     },
                                     StreamingEvent::MessageDelta { delta, usage } => {
-                                        if delta.stop_reason.is_some() {
-                                            // cache_creation_input_tokens and cache_read_input_tokens
-                                            // are cumulative totals on message_delta.usage per the
-                                            // Anthropic streaming API spec — use them directly.
+                                        if let Some(stop_reason) = delta.stop_reason.as_ref() {
+                                            final_stop_reason = Some(stop_reason.clone());
                                             let usage = PartialUsage {
                                                  output_tokens: usage.output_tokens,
                                                  input_tokens: usize::try_from(input_tokens).ok(),
-                                                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                                 cache_read_input_tokens: usage.cache_read_input_tokens
+                                                 cache_creation_input_tokens: usage
+                                                    .cache_creation_input_tokens
+                                                    .or(cache_creation_input_tokens),
+                                                 cache_read_input_tokens: usage
+                                                    .cache_read_input_tokens
+                                                    .or(cache_read_input_tokens),
                                             };
 
                                             let span = tracing::Span::current();
                                             span.record_token_usage(&usage);
                                             final_usage = Some(usage);
-                                            break;
                                         }
+                                    }
+                                    StreamingEvent::MessageStop => {
+                                        saw_message_stop = true;
                                     }
                                     _ => {}
                                 }
@@ -343,17 +355,27 @@ where
                                     }
                                     yield result;
                                 }
+
+                                if saw_message_stop {
+                                    break;
+                                }
                             },
                             Err(e) => {
                                 if !sse.data.trim().is_empty() {
+                                    stream_failed = true;
                                     yield Err(CompletionError::ResponseError(
                                         format!("Failed to parse JSON: {} (Data: {})", e, sse.data)
                                     ));
+                                    break;
                                 }
                             }
                         }
                     },
+                    Err(http_client::Error::StreamEnded) => {
+                        break;
+                    }
                     Err(e) => {
+                        stream_failed = true;
                         yield Err(CompletionError::from_stream_transport(e));
                         break;
                     }
@@ -363,8 +385,21 @@ where
             // Ensure event source is closed when stream ends
             sse_stream.close();
 
+            if stream_failed {
+                return;
+            }
+
+            if !saw_message_stop || final_stop_reason.is_none() {
+                yield Err(CompletionError::ResponseError(
+                    "Anthropic stream ended without message_stop and a terminal stop_reason"
+                        .to_owned(),
+                ));
+                return;
+            }
+
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                usage: final_usage.unwrap_or_default()
+                usage: final_usage.unwrap_or_default(),
+                stop_reason: final_stop_reason,
             }))
         }.instrument(span));
 
@@ -480,6 +515,7 @@ fn handle_event(
             Content::RedactedThinking { data } => Some(Ok(RawStreamingChoice::Reasoning {
                 id: None,
                 content: ReasoningContent::Redacted { data: data.clone() },
+                additional_params: None,
             })),
             // Handle other content types - they don't need special handling
             _ => None,
@@ -500,6 +536,7 @@ fn handle_event(
                         text: thinking_state.thinking,
                         signature,
                     },
+                    additional_params: None,
                 }));
             }
 
@@ -564,8 +601,11 @@ mod tests {
     };
     use super::*;
     use crate::OneOrMany;
-    use crate::completion::Message as RigMessage;
+    use crate::client::CompletionClient;
     use crate::completion::request::Document as RigDocument;
+    use crate::completion::{CompletionModel as _, Message as RigMessage};
+    use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
+    use crate::test_utils::MockStreamingClient;
     use async_stream::stream;
     use futures::StreamExt;
 
@@ -577,6 +617,134 @@ mod tests {
         + 'static,
     ) -> crate::streaming::StreamingResult<StreamingCompletionResponse> {
         Box::pin(stream)
+    }
+
+    #[tokio::test]
+    async fn stream_requires_message_stop_after_terminal_delta() {
+        let client = crate::providers::anthropic::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null
+                    },
+                    "usage": { "output_tokens": 3 }
+                })]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model(CLAUDE_OPUS_4_8);
+        let request = model.completion_request("hello").max_tokens(64).build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        let error = stream
+            .next()
+            .await
+            .expect("truncated stream should yield an error")
+            .expect_err("stream without message_stop must fail");
+
+        assert!(matches!(error, CompletionError::ResponseError(_)));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_carries_message_start_cache_usage_into_final_response() {
+        let events = [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [],
+                    "model": CLAUDE_OPUS_4_8,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": 11,
+                        "cache_read_input_tokens": 7,
+                        "cache_creation_input_tokens": 5,
+                        "output_tokens": 0
+                    }
+                }
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null
+                },
+                "usage": { "output_tokens": 3 }
+            }),
+            json!({ "type": "message_stop" }),
+        ];
+        let client = crate::providers::anthropic::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&events),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model(CLAUDE_OPUS_4_8);
+        let request = model.completion_request("hello").max_tokens(64).build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut usage = None;
+
+        while let Some(item) = stream.next().await {
+            if let crate::streaming::StreamedAssistantContent::Final(response) =
+                item.expect("complete stream should not error")
+            {
+                usage = Some(response.token_usage());
+            }
+        }
+
+        let usage = usage.expect("stream should expose final usage");
+        assert_eq!(usage.input_tokens, 23);
+        assert_eq!(usage.cached_input_tokens, 7);
+        assert_eq!(usage.cache_creation_input_tokens, 5);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 26);
+    }
+
+    #[test]
+    fn streaming_response_exposes_stop_reason_metadata() {
+        let response = StreamingCompletionResponse {
+            usage: PartialUsage::default(),
+            stop_reason: Some("tool_use".to_string()),
+        };
+        let terminal = response
+            .terminal_metadata()
+            .expect("stop reason should produce terminal metadata");
+
+        assert_eq!(
+            terminal.reason(),
+            crate::completion::CompletionFinishReason::ToolCalls
+        );
+        assert_eq!(terminal.raw_reason(), Some("tool_use"));
+    }
+
+    #[test]
+    fn streaming_usage_normalizes_cache_tokens_as_input_subsets() {
+        let partial = PartialUsage {
+            input_tokens: Some(11),
+            output_tokens: 3,
+            cache_read_input_tokens: Some(7),
+            cache_creation_input_tokens: Some(5),
+        };
+        let expected = partial.token_usage();
+        let streamed = StreamingCompletionResponse {
+            usage: partial,
+            stop_reason: Some("end_turn".to_string()),
+        }
+        .token_usage();
+
+        assert_eq!(expected.input_tokens, 23);
+        assert_eq!(expected.cached_input_tokens, 7);
+        assert_eq!(expected.cache_creation_input_tokens, 5);
+        assert_eq!(expected.output_tokens, 3);
+        assert_eq!(expected.total_tokens, 26);
+        assert_eq!(streamed, expected);
     }
 
     #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
@@ -638,6 +806,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(64),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -693,6 +862,7 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: Some(64),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: Some(schema),
         };
@@ -760,6 +930,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(64),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -796,6 +967,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(64),
             tool_choice: Some(crate::message::ToolChoice::Auto),
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1576,6 +1748,7 @@ mod tests {
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
                 usage: PartialUsage::default(),
+                stop_reason: Some("end_turn".to_string()),
             }));
         };
 
@@ -1721,6 +1894,7 @@ mod tests {
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
                 usage: PartialUsage::default(),
+                stop_reason: Some("end_turn".to_string()),
             }));
         };
 

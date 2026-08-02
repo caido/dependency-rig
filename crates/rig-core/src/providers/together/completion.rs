@@ -429,6 +429,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             model: None,
             output_schema: None,

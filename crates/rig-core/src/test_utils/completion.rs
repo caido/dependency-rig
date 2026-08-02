@@ -151,6 +151,7 @@ impl MockTurn {
             usage: response.usage,
             raw_response: MockResponse::with_usage(response.usage),
             message_id: response.message_id,
+            terminal_metadata: None,
         })
     }
 }
@@ -320,6 +321,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         }

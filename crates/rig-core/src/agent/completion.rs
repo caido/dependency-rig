@@ -154,6 +154,7 @@ pub(crate) async fn build_completion_request<M: CompletionModel>(
     max_tokens: Option<u64>,
     additional_params: Option<&serde_json::Value>,
     tool_choice: Option<&ToolChoice>,
+    parallel_tool_calls: Option<bool>,
     tool_server_handle: &ToolServerHandle,
     dynamic_context: &DynamicContextStore,
     output_schema: Option<&schemars::Schema>,
@@ -168,6 +169,7 @@ pub(crate) async fn build_completion_request<M: CompletionModel>(
         max_tokens,
         additional_params,
         tool_choice,
+        parallel_tool_calls,
         tool_server_handle,
         dynamic_context,
         output_schema,
@@ -195,6 +197,7 @@ pub(crate) async fn build_prepared_completion_request<M: CompletionModel>(
     max_tokens: Option<u64>,
     additional_params: Option<&serde_json::Value>,
     tool_choice: Option<&ToolChoice>,
+    parallel_tool_calls: Option<bool>,
     tool_server_handle: &ToolServerHandle,
     dynamic_context: &DynamicContextStore,
     output_schema: Option<&schemars::Schema>,
@@ -464,6 +467,7 @@ pub(crate) async fn build_prepared_completion_request<M: CompletionModel>(
         .messages(chat_history)
         .temperature_opt(temperature)
         .max_tokens_opt(max_tokens)
+        .parallel_tool_calls_opt(parallel_tool_calls)
         .additional_params_opt(additional_params)
         .documents(static_context.to_vec())
         .tools(tooldefs);
@@ -554,6 +558,8 @@ where
     pub dynamic_context: DynamicContextStore,
     /// Whether or not the underlying LLM should be forced to use a tool before providing a response.
     pub tool_choice: Option<ToolChoice>,
+    /// Whether the model provider may call multiple tools in parallel.
+    pub parallel_tool_calls: Option<bool>,
     /// Default maximum depth for recursive agent calls
     pub default_max_turns: Option<usize>,
     /// Default hook stack applied to every prompt request and runner created
@@ -612,6 +618,7 @@ where
             self.max_tokens,
             self.additional_params.as_ref(),
             self.tool_choice.as_ref(),
+            self.parallel_tool_calls,
             &self.tool_server_handle,
             &self.dynamic_context,
             self.output_schema.as_ref(),

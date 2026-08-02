@@ -65,8 +65,43 @@ pub(crate) fn merge_reasoning_blocks(
         .find(|existing| ids_match(existing))
     {
         existing.content.extend(incoming.content.clone());
+        merge_reasoning_additional_params(
+            &mut existing.additional_params,
+            incoming.additional_params.as_ref(),
+        );
     } else {
         accumulated_reasoning.push(incoming.clone());
+    }
+}
+
+fn merge_reasoning_additional_params(
+    existing: &mut Option<serde_json::Value>,
+    incoming: Option<&serde_json::Value>,
+) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+
+    let Some(existing) = existing.as_mut() else {
+        *existing = Some(incoming.clone());
+        return;
+    };
+
+    let (Some(existing), Some(incoming)) = (existing.as_object_mut(), incoming.as_object()) else {
+        *existing = incoming.clone();
+        return;
+    };
+
+    for (key, incoming_value) in incoming {
+        match (existing.get_mut(key), incoming_value) {
+            (Some(serde_json::Value::Array(existing)), serde_json::Value::Array(incoming)) => {
+                existing.extend(incoming.iter().cloned());
+            }
+            (Some(existing), incoming) => *existing = incoming.clone(),
+            (None, incoming) => {
+                existing.insert(key.clone(), incoming.clone());
+            }
+        }
     }
 }
 

@@ -106,6 +106,7 @@ pub(crate) fn create_grpc_request(
         temperature,
         max_tokens,
         tool_choice: _,
+        parallel_tool_calls: _,
         additional_params: _,
         output_schema: _,
     } = completion_request;
@@ -494,6 +495,7 @@ impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<Generat
             usage,
             raw_response: response,
             message_id: None,
+            terminal_metadata: None,
         })
     }
 }

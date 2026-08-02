@@ -233,7 +233,11 @@ impl MockStreamEvent {
                 internal_call_id,
                 content,
             }),
-            Self::Reasoning { id, content } => Ok(RawStreamingChoice::Reasoning { id, content }),
+            Self::Reasoning { id, content } => Ok(RawStreamingChoice::Reasoning {
+                id,
+                content,
+                additional_params: None,
+            }),
             Self::ReasoningDelta { id, reasoning } => {
                 Ok(RawStreamingChoice::ReasoningDelta { id, reasoning })
             }

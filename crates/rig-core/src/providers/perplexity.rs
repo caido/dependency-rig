@@ -201,6 +201,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 },
                 raw_response: response,
                 message_id: None,
+                terminal_metadata: None,
             }),
             _ => Err(CompletionError::ResponseError(
                 "Response contained no assistant message".to_owned(),

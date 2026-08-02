@@ -14,7 +14,6 @@
 //! # }
 //! ```
 use super::InputAudio;
-use super::completion::ToolChoice;
 use super::responses_api::streaming::StreamingCompletionResponse;
 use crate::completion::{CompletionError, GetTokenUsage};
 use crate::http_client;
@@ -679,6 +678,81 @@ impl From<completion::ToolDefinition> for ResponsesToolDefinition {
     }
 }
 
+/// Tool choice for the OpenAI Responses API.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    /// A plain `auto`, `none`, or `required` mode.
+    Mode(super::completion::ToolChoice),
+    /// A typed tool-choice object.
+    Definition(ToolChoiceDefinition),
+}
+
+/// A typed Responses API tool-choice object.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoiceDefinition {
+    /// Force the model to call the named function tool.
+    Function { name: String },
+    /// Restrict the model to a subset of the request's tools.
+    AllowedTools {
+        mode: AllowedToolsMode,
+        tools: Vec<AllowedTool>,
+    },
+}
+
+/// Whether an allowed tool set is optional or required.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowedToolsMode {
+    Auto,
+    Required,
+}
+
+/// One tool in an allowed tool set.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AllowedTool {
+    Function { name: String },
+}
+
+impl TryFrom<message::ToolChoice> for ToolChoice {
+    type Error = CompletionError;
+
+    fn try_from(value: message::ToolChoice) -> Result<Self, Self::Error> {
+        let choice = match value {
+            message::ToolChoice::Auto => Self::Mode(super::completion::ToolChoice::Auto),
+            message::ToolChoice::None => Self::Mode(super::completion::ToolChoice::None),
+            message::ToolChoice::Required => Self::Mode(super::completion::ToolChoice::Required),
+            message::ToolChoice::Specific { function_names } => {
+                let mut names = function_names.into_iter();
+                let Some(first) = names.next() else {
+                    return Err(CompletionError::RequestError(
+                        "ToolChoice::Specific requires at least one function name".into(),
+                    ));
+                };
+
+                match names.next() {
+                    None => Self::Definition(ToolChoiceDefinition::Function { name: first }),
+                    Some(second) => {
+                        let tools = std::iter::once(first)
+                            .chain(std::iter::once(second))
+                            .chain(names)
+                            .map(|name| AllowedTool::Function { name })
+                            .collect();
+                        Self::Definition(ToolChoiceDefinition::AllowedTools {
+                            mode: AllowedToolsMode::Required,
+                            tools,
+                        })
+                    }
+                }
+            }
+        };
+
+        Ok(choice)
+    }
+}
+
 /// Token usage.
 /// Token usage from the OpenAI Responses API generally shows the input tokens and output tokens (both with more in-depth details) as well as a total tokens field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -930,6 +1004,9 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
             {
                 include.push(Include::ReasoningEncryptedContent);
             }
+        }
+        if req.parallel_tool_calls.is_some() {
+            additional_parameters.parallel_tool_calls = req.parallel_tool_calls;
         }
 
         // Apply output_schema as structured output if not already configured via additional_params
@@ -1495,6 +1572,7 @@ impl From<Output> for Vec<completion::AssistantContent> {
                     message::Reasoning {
                         id: Some(id),
                         content,
+                        additional_params: None,
                     },
                 )]
             }
@@ -1674,6 +1752,9 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     type Error = CompletionError;
 
     fn try_from(response: CompletionResponse) -> Result<Self, Self::Error> {
+        ensure_terminal_success(&response)?;
+        let terminal_metadata = terminal_metadata_from_response(&response);
+        let is_incomplete = response.status == ResponseStatus::Incomplete;
         // Extract the msg_ ID from the first Output::Message item
         let message_id = response.output.iter().find_map(|item| match item {
             Output::Message(msg) => Some(msg.id.clone()),
@@ -1704,11 +1785,17 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             })
             .unwrap_or(output_content);
 
-        let choice = OneOrMany::many(content).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
-            )
-        })?;
+        let choice = match OneOrMany::many(content) {
+            Ok(choice) => choice,
+            Err(_) if is_incomplete => {
+                OneOrMany::one(completion::AssistantContent::text(String::new()))
+            }
+            Err(_) => {
+                return Err(CompletionError::ResponseError(
+                    "Response contained no message or tool call (empty)".to_owned(),
+                ));
+            }
+        };
 
         let usage = response
             .usage
@@ -1721,8 +1808,78 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             usage,
             raw_response: response,
             message_id,
+            terminal_metadata,
         })
     }
+}
+
+fn ensure_terminal_success(response: &CompletionResponse) -> Result<(), CompletionError> {
+    match response.status {
+        ResponseStatus::Completed | ResponseStatus::Incomplete => Ok(()),
+        ResponseStatus::Failed => Err(CompletionError::from_provider_body(
+            serde_json::to_string(response).unwrap_or_else(|_| {
+                response
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| {
+                        "OpenAI Responses API returned a failed response".to_string()
+                    })
+            }),
+        )),
+        ResponseStatus::Cancelled | ResponseStatus::InProgress | ResponseStatus::Queued => {
+            Err(CompletionError::ProviderError(format!(
+                "OpenAI Responses API ended in state {:?}",
+                response.status
+            )))
+        }
+    }
+}
+
+pub(crate) fn terminal_metadata_from_response(
+    response: &CompletionResponse,
+) -> Option<completion::CompletionTerminalMetadata> {
+    match response.status {
+        ResponseStatus::Completed => {
+            let reason = if response
+                .output
+                .iter()
+                .any(|output| matches!(output, Output::FunctionCall(_)))
+            {
+                completion::CompletionFinishReason::ToolCalls
+            } else {
+                completion::CompletionFinishReason::Stop
+            };
+            Some(completion::CompletionTerminalMetadata::new(reason).with_raw_reason("completed"))
+        }
+        ResponseStatus::Incomplete => Some(
+            response
+                .incomplete_details
+                .as_ref()
+                .map(|details| terminal_metadata_from_incomplete_reason(&details.reason))
+                .unwrap_or_else(|| {
+                    completion::CompletionTerminalMetadata::new(
+                        completion::CompletionFinishReason::Unknown,
+                    )
+                }),
+        ),
+        ResponseStatus::Failed
+        | ResponseStatus::Cancelled
+        | ResponseStatus::InProgress
+        | ResponseStatus::Queued => None,
+    }
+}
+
+fn terminal_metadata_from_incomplete_reason(
+    raw_reason: &str,
+) -> completion::CompletionTerminalMetadata {
+    let reason = match raw_reason {
+        "max_output_tokens" => completion::CompletionFinishReason::Length,
+        "content_filter" => completion::CompletionFinishReason::ContentFilter,
+        _ => completion::CompletionFinishReason::Unknown,
+    };
+
+    completion::CompletionTerminalMetadata::new(reason).with_raw_reason(raw_reason)
 }
 
 /// An OpenAI Responses API message.
@@ -2137,6 +2294,92 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    #[test]
+    fn responses_tool_choice_modes_serialize_as_plain_strings() {
+        for (choice, expected) in [
+            (message::ToolChoice::Auto, json!("auto")),
+            (message::ToolChoice::None, json!("none")),
+            (message::ToolChoice::Required, json!("required")),
+        ] {
+            let converted = ToolChoice::try_from(choice).expect("mode should convert");
+            assert_eq!(
+                serde_json::to_value(&converted).expect("serialize tool choice"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn responses_tool_choice_specific_single_name_serializes_as_named_function() {
+        let converted = ToolChoice::try_from(message::ToolChoice::Specific {
+            function_names: vec!["get_weather".to_string()],
+        })
+        .expect("single specific tool should convert");
+
+        assert_eq!(
+            serde_json::to_value(&converted).expect("serialize tool choice"),
+            json!({"type": "function", "name": "get_weather"})
+        );
+    }
+
+    #[test]
+    fn responses_tool_choice_specific_multiple_names_serialize_as_allowed_tools() {
+        let converted = ToolChoice::try_from(message::ToolChoice::Specific {
+            function_names: vec!["add".to_string(), "subtract".to_string()],
+        })
+        .expect("multiple specific tools should convert");
+
+        assert_eq!(
+            serde_json::to_value(&converted).expect("serialize tool choice"),
+            json!({
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [
+                    {"type": "function", "name": "add"},
+                    {"type": "function", "name": "subtract"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn responses_tool_choice_specific_rejects_empty_names() {
+        let converted = ToolChoice::try_from(message::ToolChoice::Specific {
+            function_names: Vec::new(),
+        });
+
+        assert!(matches!(
+            converted,
+            Err(CompletionError::RequestError(error))
+                if error.to_string().contains("at least one function name")
+        ));
+    }
+
+    #[test]
+    fn responses_request_serializes_named_tool_choice_and_parallel_control() {
+        let request = CompletionRequestBuilder::new(MockCompletionModel::default(), "weather")
+            .tool(completion::ToolDefinition {
+                name: "get_weather".to_string(),
+                description: "Get weather".to_string(),
+                parameters: json!({"type": "object"}),
+            })
+            .tool_choice(message::ToolChoice::Specific {
+                function_names: vec!["get_weather".to_string()],
+            })
+            .parallel_tool_calls(false)
+            .build();
+
+        let request = CompletionRequest::try_from(("gpt-test".to_string(), request))
+            .expect("request should convert");
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(
+            json["tool_choice"],
+            json!({"type": "function", "name": "get_weather"})
+        );
+        assert_eq!(json["parallel_tool_calls"], false);
+    }
+
     fn test_document(id: &str, text: &str) -> crate::completion::Document {
         crate::completion::Document {
             id: id.to_string(),
@@ -2167,6 +2410,163 @@ mod tests {
             response.additional_parameters.service_tier,
             Some(OpenAIServiceTier::Standard)
         ));
+    }
+
+    #[test]
+    fn incomplete_response_preserves_usage_and_exposes_length_finish_reason() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_incomplete",
+            "object": "response",
+            "created_at": 0,
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "model": "gpt-test",
+            "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": { "cached_tokens": 3 },
+                "output_tokens": 16,
+                "output_tokens_details": { "reasoning_tokens": 4 },
+                "total_tokens": 28
+            },
+            "output": [{
+                "type": "message",
+                "id": "msg_incomplete",
+                "status": "incomplete",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "annotations": [],
+                    "text": "partial"
+                }]
+            }],
+            "tools": []
+        }))
+        .expect("incomplete response should deserialize");
+
+        let converted: completion::CompletionResponse<CompletionResponse> = response
+            .try_into()
+            .expect("an output-limited response remains a successful completion");
+        let metadata = converted
+            .terminal_metadata
+            .as_ref()
+            .expect("incomplete reason should be normalized");
+
+        assert_eq!(
+            metadata.reason(),
+            completion::CompletionFinishReason::Length
+        );
+        assert_eq!(metadata.raw_reason(), Some("max_output_tokens"));
+        assert_eq!(converted.usage.input_tokens, 12);
+        assert_eq!(converted.usage.output_tokens, 16);
+        assert_eq!(converted.usage.cached_input_tokens, 3);
+        assert_eq!(converted.usage.reasoning_tokens, 4);
+        assert_eq!(converted.raw_response.status, ResponseStatus::Incomplete);
+        assert!(matches!(
+            converted.choice.first(),
+            completion::AssistantContent::Text(message::Text { text, .. }) if text == "partial"
+        ));
+    }
+
+    #[test]
+    fn empty_incomplete_response_preserves_terminal_metadata_and_usage() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_incomplete",
+            "object": "response",
+            "created_at": 0,
+            "status": "incomplete",
+            "incomplete_details": { "reason": "content_filter" },
+            "model": "gpt-test",
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 2,
+                "output_tokens_details": { "reasoning_tokens": 2 },
+                "total_tokens": 7
+            },
+            "output": [],
+            "tools": []
+        }))
+        .expect("empty incomplete response should deserialize");
+
+        let converted: completion::CompletionResponse<CompletionResponse> = response
+            .try_into()
+            .expect("empty incomplete response should retain terminal data");
+        let metadata = converted
+            .terminal_metadata
+            .expect("incomplete response should expose terminal metadata");
+
+        assert_eq!(
+            metadata.reason(),
+            completion::CompletionFinishReason::ContentFilter
+        );
+        assert_eq!(metadata.raw_reason(), Some("content_filter"));
+        assert_eq!(converted.usage.total_tokens, 7);
+        assert_eq!(converted.usage.reasoning_tokens, 2);
+        assert!(matches!(
+            converted.choice.first(),
+            completion::AssistantContent::Text(message::Text { text, .. }) if text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn completed_function_call_exposes_tool_calls_finish_reason() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_tool_call",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": "gpt-test",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{}",
+                "status": "completed"
+            }]
+        }))
+        .expect("completed tool-call response should deserialize");
+
+        let converted: completion::CompletionResponse<CompletionResponse> = response
+            .try_into()
+            .expect("completed tool-call response should remain successful");
+        let metadata = converted
+            .terminal_metadata
+            .expect("completed response should expose terminal metadata");
+
+        assert_eq!(
+            metadata.reason(),
+            completion::CompletionFinishReason::ToolCalls
+        );
+        assert_eq!(metadata.raw_reason(), Some("completed"));
+    }
+
+    #[test]
+    fn failed_response_remains_a_provider_error() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_failed",
+            "object": "response",
+            "created_at": 0,
+            "status": "failed",
+            "error": {
+                "code": "server_error",
+                "message": "generation failed"
+            },
+            "model": "gpt-test"
+        }))
+        .expect("failed response should deserialize");
+
+        let error = match completion::CompletionResponse::<CompletionResponse>::try_from(response) {
+            Ok(_) => panic!("failed response must not become a successful completion"),
+            Err(error) => error,
+        };
+        let body = error
+            .provider_response_json()
+            .expect("provider response body should contain JSON")
+            .expect("provider response body should be preserved");
+
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"]["code"], "server_error");
+        assert_eq!(body["error"]["message"], "generation failed");
     }
 
     #[test]
@@ -2253,6 +2653,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -2687,6 +3088,7 @@ mod tests {
                 content: vec![message::ReasoningContent::Summary(
                     "structured summary".to_string(),
                 )],
+                additional_params: None,
             })),
         };
 
@@ -2712,6 +3114,7 @@ mod tests {
                 content: vec![message::ReasoningContent::Summary(
                     "structured summary".to_string(),
                 )],
+                additional_params: None,
             })),
         };
 
@@ -2736,6 +3139,7 @@ mod tests {
                     content: vec![message::ReasoningContent::Summary(
                         "structured summary".to_string(),
                     )],
+                    additional_params: None,
                 }),
                 message::AssistantContent::Text(Text::new("final answer")),
                 message::AssistantContent::tool_call_with_call_id(
@@ -2825,6 +3229,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(64),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };

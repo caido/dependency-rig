@@ -782,6 +782,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(256),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };

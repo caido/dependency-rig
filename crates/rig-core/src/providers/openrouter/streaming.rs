@@ -6,23 +6,31 @@ use tracing::info_span;
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
 use crate::http_client::HttpClientExt;
 use crate::json_utils;
+use crate::message::ReasoningContent;
 use crate::providers::internal::openai_chat_completions_compatible::{
-    self, CompatibleChoiceData, CompatibleChunk, CompatibleFinishReason, CompatibleStreamProfile,
-    CompatibleToolCallChunk,
+    self, CompatibleChoiceData, CompatibleChunk, CompatibleFinishReason, CompatibleReasoningDetail,
+    CompatibleStreamProfile, CompatibleToolCallChunk,
 };
 use crate::providers::openrouter::{
     OpenRouterRequestParams, OpenrouterCompletionRequest, ReasoningDetails,
+    client::has_populated_error, completion::terminal_metadata_from_finish_reason,
 };
 use crate::streaming;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StreamingCompletionResponse {
     pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_metadata: Option<crate::completion::CompletionTerminalMetadata>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> crate::completion::Usage {
         self.usage.token_usage()
+    }
+
+    fn terminal_metadata(&self) -> Option<crate::completion::CompletionTerminalMetadata> {
+        self.terminal_metadata.clone()
     }
 }
 
@@ -36,6 +44,19 @@ pub enum FinishReason {
     Length,
     #[serde(untagged)]
     Other(String),
+}
+
+impl FinishReason {
+    fn raw_reason(&self) -> &str {
+        match self {
+            Self::ToolCalls => "tool_calls",
+            Self::Stop => "stop",
+            Self::Error => "error",
+            Self::ContentFilter => "content_filter",
+            Self::Length => "length",
+            Self::Other(reason) => reason,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -84,6 +105,14 @@ pub struct Usage {
     /// with server-side automatic caching).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 /// Prompt-token breakdown reported by OpenRouter for cached streaming requests.
@@ -106,6 +135,11 @@ impl GetTokenUsage for Usage {
             .as_ref()
             .map(|d| (d.cached_tokens as u64, d.cache_write_tokens as u64))
             .unwrap_or((0, 0));
+        let reasoning_tokens = self
+            .completion_tokens_details
+            .as_ref()
+            .map(|details| details.reasoning_tokens as u64)
+            .unwrap_or(0);
         crate::completion::Usage {
             input_tokens: self.prompt_tokens as u64,
             output_tokens: self.completion_tokens as u64,
@@ -113,7 +147,7 @@ impl GetTokenUsage for Usage {
             cached_input_tokens: cached_input,
             cache_creation_input_tokens: cache_creation,
             tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens,
         }
     }
 }
@@ -134,7 +168,7 @@ struct StreamingDelta {
     pub tool_calls: Vec<StreamingToolCall>,
     pub reasoning: Option<String>,
     #[serde(default, deserialize_with = "json_utils::null_or_vec")]
-    pub reasoning_details: Vec<ReasoningDetails>,
+    pub reasoning_details: Vec<Value>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -216,20 +250,42 @@ struct OpenRouterCompatibleProfile;
 
 impl CompatibleStreamProfile for OpenRouterCompatibleProfile {
     type Usage = Usage;
-    type Detail = ReasoningDetails;
+    type Detail = Value;
     type FinalResponse = StreamingCompletionResponse;
 
     fn normalize_chunk(
         &self,
         data: &str,
     ) -> Result<Option<CompatibleChunk<Self::Usage, Self::Detail>>, CompletionError> {
-        let data = match serde_json::from_str::<StreamingCompletionChunk>(data) {
-            Ok(data) => data,
+        let raw_data = data;
+        let value = match serde_json::from_str::<Value>(data) {
+            Ok(value) => value,
             Err(error) => {
                 tracing::error!(?error, message = data, "Failed to parse SSE message");
-                return Ok(None);
+                return Err(CompletionError::JsonError(error));
             }
         };
+        if has_populated_error(&value) {
+            return Err(CompletionError::from_provider_body(data));
+        }
+
+        let data = match serde_json::from_value::<StreamingCompletionChunk>(value) {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::error!(?error, message = raw_data, "Failed to parse SSE message");
+                return Err(CompletionError::ResponseError(format!(
+                    "Failed to parse OpenRouter streaming response: {error} (Data: {raw_data})"
+                )));
+            }
+        };
+        if data
+            .choices
+            .first()
+            .and_then(|choice| choice.finish_reason.as_ref())
+            .is_some_and(|reason| matches!(reason, FinishReason::Error))
+        {
+            return Err(CompletionError::from_provider_body(raw_data));
+        }
 
         Ok(Some(
             openai_chat_completions_compatible::normalize_first_choice_chunk(
@@ -237,25 +293,46 @@ impl CompatibleStreamProfile for OpenRouterCompatibleProfile {
                 Some(data.model),
                 data.usage,
                 &data.choices,
-                |choice| CompatibleChoiceData {
-                    finish_reason: if choice.finish_reason == Some(FinishReason::ToolCalls) {
-                        CompatibleFinishReason::ToolCalls
-                    } else {
-                        CompatibleFinishReason::Other
-                    },
-                    text: choice.delta.content.clone(),
-                    reasoning: choice.delta.reasoning.clone(),
-                    tool_calls: openai_chat_completions_compatible::tool_call_chunks(
-                        &choice.delta.tool_calls,
-                    ),
-                    details: choice.delta.reasoning_details.clone(),
+                |choice| {
+                    let terminal_metadata = choice.finish_reason.as_ref().and_then(|reason| {
+                        terminal_metadata_from_finish_reason(Some(reason.raw_reason()))
+                    });
+                    CompatibleChoiceData {
+                        finish_reason: terminal_metadata
+                            .map(CompatibleFinishReason::Terminal)
+                            .unwrap_or(CompatibleFinishReason::Other),
+                        text: choice.delta.content.clone(),
+                        reasoning: choice.delta.reasoning.clone(),
+                        tool_calls: openai_chat_completions_compatible::tool_call_chunks(
+                            &choice.delta.tool_calls,
+                        ),
+                        details: choice.delta.reasoning_details.clone(),
+                    }
                 },
             ),
         ))
     }
 
     fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse {
-        StreamingCompletionResponse { usage }
+        StreamingCompletionResponse {
+            usage,
+            terminal_metadata: None,
+        }
+    }
+
+    fn build_final_response_with_terminal_metadata(
+        &self,
+        usage: Self::Usage,
+        terminal_metadata: Option<crate::completion::CompletionTerminalMetadata>,
+    ) -> Self::FinalResponse {
+        StreamingCompletionResponse {
+            usage,
+            terminal_metadata,
+        }
+    }
+
+    fn requires_terminal_metadata(&self) -> bool {
+        true
     }
 
     fn decorate_tool_call(
@@ -263,16 +340,63 @@ impl CompatibleStreamProfile for OpenRouterCompatibleProfile {
         detail: &Self::Detail,
         tool_calls: &mut std::collections::HashMap<usize, crate::streaming::RawStreamingToolCall>,
     ) {
-        if let ReasoningDetails::Encrypted { id, data, .. } = detail
+        if let Ok(ReasoningDetails::Encrypted { id, data, .. }) =
+            serde_json::from_value::<ReasoningDetails>(detail.clone())
             && let Some(id) = id
             && let Some(tool_call) = tool_calls
                 .values_mut()
-                .find(|tool_call| tool_call.id.eq(id))
-            && let Ok(additional_params) = serde_json::to_value(detail)
+                .find(|tool_call| tool_call.id.eq(&id))
         {
-            tool_call.signature = Some(data.clone());
-            tool_call.additional_params = Some(additional_params);
+            tool_call.signature = Some(data);
+            tool_call.additional_params = Some(detail.clone());
         }
+    }
+
+    fn reasoning_detail(&self, detail: &Self::Detail) -> Option<CompatibleReasoningDetail> {
+        let (id, content) = match serde_json::from_value::<ReasoningDetails>(detail.clone()).ok()? {
+            ReasoningDetails::Summary { id, summary, .. } => {
+                (id, ReasoningContent::Summary(summary))
+            }
+            ReasoningDetails::Encrypted { id, data, .. } => (id, ReasoningContent::Encrypted(data)),
+            ReasoningDetails::Text {
+                id,
+                text,
+                signature,
+                ..
+            } => (
+                id,
+                ReasoningContent::Text {
+                    text: text.unwrap_or_default(),
+                    signature,
+                },
+            ),
+        };
+
+        Some(CompatibleReasoningDetail {
+            id,
+            content,
+            additional_params: Some(serde_json::json!({
+                "reasoning_details": [detail.clone()]
+            })),
+        })
+    }
+
+    fn legacy_reasoning_is_redundant(
+        &self,
+        legacy_reasoning: &str,
+        details: &[CompatibleReasoningDetail],
+    ) -> bool {
+        let typed_text = details
+            .iter()
+            .filter_map(|detail| match &detail.content {
+                ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                ReasoningContent::Summary(summary) => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        !typed_text.is_empty()
+            && (typed_text.contains(&legacy_reasoning) || typed_text.concat() == legacy_reasoning)
     }
 }
 
@@ -294,6 +418,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{AssistantContent, ReasoningContent};
     use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_data_lines;
     use crate::streaming::StreamedAssistantContent;
     use crate::test_utils::MockStreamingClient;
@@ -418,6 +543,9 @@ mod tests {
                 "prompt_tokens_details": {
                     "cached_tokens": 400,
                     "cache_write_tokens": 60
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": 9
                 }
             }
         });
@@ -430,6 +558,7 @@ mod tests {
         assert_eq!(token_usage.output_tokens, 20);
         assert_eq!(token_usage.cached_input_tokens, 400);
         assert_eq!(token_usage.cache_creation_input_tokens, 60);
+        assert_eq!(token_usage.reasoning_tokens, 9);
     }
 
     #[test]
@@ -455,6 +584,7 @@ mod tests {
 
         assert_eq!(token_usage.cached_input_tokens, 0);
         assert_eq!(token_usage.cache_creation_input_tokens, 0);
+        assert_eq!(token_usage.reasoning_tokens, 0);
     }
 
     #[test]
@@ -559,6 +689,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_error_and_choices_stream_event_is_rejected() {
+        let raw = r#"{"id":"cmpl-error","model":"openai/gpt-4o","error":{"code":500,"message":"Provider disconnected"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#;
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([raw]),
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .expect("stream should start");
+
+        let error = stream
+            .next()
+            .await
+            .expect("provider error should be emitted")
+            .expect_err("mixed error event must fail");
+
+        assert!(matches!(error, CompletionError::ProviderResponse(_)));
+        assert_eq!(error.provider_response_body(), Some(raw));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_without_finish_reason_ends_with_response_error() {
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                r#"{"id":"gen-truncated","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}],"usage":null}"#,
+                "[DONE]",
+            ]),
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .expect("stream should start");
+        let mut saw_partial = false;
+        let mut terminal_error = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamedAssistantContent::Text(text)) if text.text == "partial" => {
+                    saw_partial = true;
+                }
+                Err(error) => terminal_error = Some(error),
+                _ => {}
+            }
+        }
+
+        assert!(saw_partial);
+        assert!(matches!(
+            terminal_error,
+            Some(CompletionError::ResponseError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_response_exposes_terminal_metadata_and_reasoning_usage() {
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                r#"{"id":"gen-final","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10,"completion_tokens_details":{"reasoning_tokens":3}}}"#,
+                "[DONE]",
+            ]),
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .expect("stream should start");
+        let mut final_response = None;
+
+        while let Some(item) = stream.next().await {
+            if let StreamedAssistantContent::Final(response) =
+                item.expect("complete stream should not error")
+            {
+                final_response = Some(response);
+            }
+        }
+
+        let final_response = final_response.expect("stream should yield a final response");
+        let terminal = final_response
+            .terminal_metadata()
+            .expect("finish reason should produce terminal metadata");
+        assert_eq!(
+            terminal.reason(),
+            crate::completion::CompletionFinishReason::Length
+        );
+        assert_eq!(terminal.raw_reason(), Some("length"));
+        assert_eq!(final_response.token_usage().reasoning_tokens, 3);
+    }
+
+    #[tokio::test]
     async fn encrypted_reasoning_details_attach_to_emitted_tool_calls() {
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines([
@@ -579,13 +809,22 @@ mod tests {
             .await
             .expect("stream should start");
 
-        let tool_call = loop {
-            match stream.next().await.expect("stream should yield an item") {
-                Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => break tool_call,
-                Ok(_) => continue,
-                Err(err) => panic!("stream should not error: {err}"),
+        let mut tool_call = None;
+        let mut encrypted_reasoning = None;
+        while let Some(item) = stream.next().await {
+            match item.expect("stream should not error") {
+                StreamedAssistantContent::ToolCall {
+                    tool_call: call, ..
+                } => {
+                    tool_call = Some(call);
+                }
+                StreamedAssistantContent::Reasoning(reasoning) => {
+                    encrypted_reasoning = Some(reasoning);
+                }
+                _ => {}
             }
-        };
+        }
+        let tool_call = tool_call.expect("stream should yield a tool call");
 
         assert_eq!(tool_call.id, "call_123");
         assert_eq!(tool_call.function.name, "search");
@@ -600,6 +839,153 @@ mod tests {
                 "index": 0,
                 "data": "enc_blob"
             }))
+        );
+        assert!(matches!(
+            encrypted_reasoning,
+            Some(crate::message::Reasoning {
+                id: Some(id),
+                content,
+                ..
+            }) if id == "call_123"
+                && matches!(
+                    content.as_slice(),
+                    [ReasoningContent::Encrypted(data)] if data == "enc_blob"
+                )
+        ));
+
+        let messages =
+            Vec::<crate::providers::openrouter::Message>::try_from(stream.choice.clone())
+                .expect("streamed assistant content should convert to OpenRouter history");
+        let replay = serde_json::to_value(&messages[0]).expect("history should serialize");
+        assert_eq!(
+            replay["reasoning_details"],
+            json!([{
+                "type": "reasoning.encrypted",
+                "id": "call_123",
+                "format": "opaque",
+                "index": 0,
+                "data": "enc_blob"
+            }]),
+            "tool-call decoration and typed reasoning must replay one detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_details_stream_in_order_and_replay_exactly_without_legacy_duplicate() {
+        let details = json!([
+            {
+                "type": "reasoning.text",
+                "id": "rs_1",
+                "format": "openai-responses-v1",
+                "index": 0,
+                "text": "typed thought",
+                "signature": "sig_1"
+            },
+            {
+                "type": "reasoning.summary",
+                "id": "rs_1",
+                "format": "openai-responses-v1",
+                "index": 1,
+                "summary": "typed summary",
+                "provider_trace": "trace_1"
+            },
+            {
+                "type": "reasoning.encrypted",
+                "id": "rs_1",
+                "format": "openai-responses-v1",
+                "index": 2,
+                "data": "enc_blob"
+            }
+        ]);
+        let chunk = json!({
+            "id": "gen-1",
+            "model": "openai/gpt-5.2",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning": "typed thought",
+                    "reasoning_details": details
+                },
+                "finish_reason": null
+            }],
+            "usage": null
+        });
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                chunk.to_string(),
+                json!({
+                    "id": "gen-2",
+                    "model": "openai/gpt-5.2",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": null
+                })
+                .to_string(),
+                "[DONE]".to_string(),
+            ]),
+        };
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .expect("stream should start");
+        let mut reasoning = Vec::new();
+        let mut legacy_reasoning_deltas = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            match item.expect("stream should not error") {
+                StreamedAssistantContent::Reasoning(item) => reasoning.push(item),
+                StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                    legacy_reasoning_deltas.push(reasoning);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(reasoning.len(), 3);
+        assert!(matches!(
+            reasoning[0].content.as_slice(),
+            [ReasoningContent::Text {
+                text,
+                signature: Some(signature)
+            }] if text == "typed thought" && signature == "sig_1"
+        ));
+        assert!(matches!(
+            reasoning[1].content.as_slice(),
+            [ReasoningContent::Summary(summary)] if summary == "typed summary"
+        ));
+        assert!(matches!(
+            reasoning[2].content.as_slice(),
+            [ReasoningContent::Encrypted(data)] if data == "enc_blob"
+        ));
+        assert!(
+            legacy_reasoning_deltas.is_empty(),
+            "equivalent legacy reasoning must not be emitted alongside typed details"
+        );
+
+        let choice = stream.choice.clone();
+        assert_eq!(
+            choice
+                .iter()
+                .filter(|item| matches!(item, AssistantContent::Reasoning(_)))
+                .count(),
+            3
+        );
+        let messages = Vec::<crate::providers::openrouter::Message>::try_from(choice)
+            .expect("streamed assistant reasoning should convert to OpenRouter history");
+        let replay = serde_json::to_value(&messages[0]).expect("history should serialize");
+
+        assert_eq!(replay["reasoning_details"], details);
+        assert!(
+            replay.get("reasoning").is_none(),
+            "typed reasoning_details must not be duplicated into legacy reasoning"
         );
     }
 }

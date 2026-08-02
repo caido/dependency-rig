@@ -94,6 +94,12 @@ pub(crate) enum ApiResponse<T> {
     Err(ApiErrorResponse),
 }
 
+pub(crate) fn has_populated_error(value: &serde_json::Value) -> bool {
+    value.get("error").is_some_and(|error| {
+        error.is_object() || error.as_str().is_some_and(|message| !message.is_empty())
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
@@ -107,6 +113,14 @@ pub struct Usage {
     /// with server-side automatic caching).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: usize,
 }
 
 /// Prompt-token breakdown reported by OpenRouter for cached requests.
@@ -139,6 +153,11 @@ impl GetTokenUsage for Usage {
             .as_ref()
             .map(|d| (d.cached_tokens as u64, d.cache_write_tokens as u64))
             .unwrap_or((0, 0));
+        let reasoning_tokens = self
+            .completion_tokens_details
+            .as_ref()
+            .map(|details| details.reasoning_tokens as u64)
+            .unwrap_or(0);
         crate::completion::Usage {
             input_tokens: self.prompt_tokens as u64,
             output_tokens: self.completion_tokens as u64,
@@ -146,7 +165,7 @@ impl GetTokenUsage for Usage {
             cached_input_tokens: cached_input,
             cache_creation_input_tokens: cache_creation,
             tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens,
         }
     }
 }

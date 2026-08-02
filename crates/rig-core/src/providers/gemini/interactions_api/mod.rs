@@ -513,6 +513,7 @@ impl TryFrom<Interaction> for completion::CompletionResponse<Interaction> {
             usage,
             raw_response: response,
             message_id: None,
+            terminal_metadata: None,
         })
     }
 }
@@ -574,6 +575,7 @@ fn assistant_content_from_output(
             Ok(Some(completion::AssistantContent::Reasoning(Reasoning {
                 id: None,
                 content: reasoning_content,
+                additional_params: None,
             })))
         }
         Content::Image(ImageContent {
@@ -2549,6 +2551,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(128),
             tool_choice: Some(MessageToolChoice::Required),
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };

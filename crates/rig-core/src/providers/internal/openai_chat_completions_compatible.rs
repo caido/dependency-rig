@@ -13,10 +13,11 @@ use futures::StreamExt;
 use http::Request;
 use tracing_futures::Instrument;
 
-use crate::completion::{CompletionError, GetTokenUsage};
+use crate::completion::{CompletionError, CompletionTerminalMetadata, GetTokenUsage};
 use crate::http_client::HttpClientExt;
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::json_utils;
+use crate::message::ReasoningContent;
 use crate::streaming::{self, RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
 use crate::wasm_compat::WasmCompatSend;
 
@@ -27,24 +28,41 @@ fn provider_response_from_compatible_sse_data(data: &str) -> Option<CompletionEr
     // error event) or a non-empty string (`{"error":"oops"}`, used by some
     // gateways). A `{"error":null}` or `{"error":""}` chunk — which some providers
     // send alongside the terminal usage event — must not terminate the stream.
-    let error = value
+    value
         .get("error")
         .filter(|error| error.is_object() || error.as_str().is_some_and(|s| !s.is_empty()))?;
     if value.get("choices").is_some() {
         return None;
     }
 
-    if let Some(message) = error.get("message").and_then(serde_json::Value::as_str) {
-        tracing::warn!(message, "provider returned a streaming error event");
-    }
+    tracing::warn!("provider returned a streaming error event");
 
     Some(crate::provider_response::completion_error_from_body(data))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompatibleFinishReason {
     ToolCalls,
     Other,
+    Terminal(CompletionTerminalMetadata),
+}
+
+impl CompatibleFinishReason {
+    fn is_tool_calls(&self) -> bool {
+        matches!(self, Self::ToolCalls)
+            || matches!(
+                self,
+                Self::Terminal(metadata)
+                    if metadata.reason() == crate::completion::CompletionFinishReason::ToolCalls
+            )
+    }
+
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        match self {
+            Self::Terminal(metadata) => Some(metadata.clone()),
+            Self::ToolCalls | Self::Other => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +124,13 @@ pub(crate) struct CompatibleChunk<U, D> {
     pub(crate) usage: Option<U>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CompatibleReasoningDetail {
+    pub(crate) id: Option<String>,
+    pub(crate) content: ReasoningContent,
+    pub(crate) additional_params: Option<serde_json::Value>,
+}
+
 pub(crate) type NormalizedCompatibleChunk<U, D> =
     Result<Option<CompatibleChunk<U, D>>, CompletionError>;
 
@@ -164,6 +189,18 @@ pub(crate) trait CompatibleStreamProfile: WasmCompatSend {
 
     fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse;
 
+    fn build_final_response_with_terminal_metadata(
+        &self,
+        usage: Self::Usage,
+        _terminal_metadata: Option<CompletionTerminalMetadata>,
+    ) -> Self::FinalResponse {
+        self.build_final_response(usage)
+    }
+
+    fn requires_terminal_metadata(&self) -> bool {
+        false
+    }
+
     fn uses_distinct_tool_call_eviction(&self) -> bool {
         false
     }
@@ -182,6 +219,18 @@ pub(crate) trait CompatibleStreamProfile: WasmCompatSend {
         _detail: &Self::Detail,
         _tool_calls: &mut HashMap<usize, RawStreamingToolCall>,
     ) {
+    }
+
+    fn reasoning_detail(&self, _detail: &Self::Detail) -> Option<CompatibleReasoningDetail> {
+        None
+    }
+
+    fn legacy_reasoning_is_redundant(
+        &self,
+        _legacy_reasoning: &str,
+        _details: &[CompatibleReasoningDetail],
+    ) -> bool {
+        false
     }
 
     fn emits_complete_single_chunk_tool_calls(&self) -> bool {
@@ -231,6 +280,7 @@ where
     let stream = stream! {
         let mut tool_calls: HashMap<usize, RawStreamingToolCall> = HashMap::new();
         let mut final_usage = None;
+        let mut terminal_metadata = None;
         let mut terminated_with_error = false;
 
         while let Some(event_result) = event_source.next().await {
@@ -273,6 +323,10 @@ where
                     let Some(choice) = chunk.choice else {
                         continue;
                     };
+
+                    if let Some(metadata) = choice.finish_reason.terminal_metadata() {
+                        terminal_metadata = Some(metadata);
+                    }
 
                     for incoming in choice.tool_calls {
                         if let Some(existing) = tool_calls.get(&incoming.index)
@@ -332,12 +386,28 @@ where
                         }
                     }
 
+                    let mut reasoning_details = Vec::new();
                     for detail in &choice.details {
                         profile.decorate_tool_call(detail, &mut tool_calls);
+                        if let Some(reasoning) = profile.reasoning_detail(detail) {
+                            reasoning_details.push(reasoning);
+                        }
+                    }
+
+                    for detail in &reasoning_details {
+                        yield Ok(RawStreamingChoice::Reasoning {
+                            id: detail.id.clone(),
+                            content: detail.content.clone(),
+                            additional_params: detail.additional_params.clone(),
+                        });
                     }
 
                     if let Some(reasoning) = choice.reasoning
                         && !reasoning.is_empty()
+                        && !profile.legacy_reasoning_is_redundant(
+                            &reasoning,
+                            &reasoning_details,
+                        )
                     {
                         yield Ok(RawStreamingChoice::ReasoningDelta {
                             id: None,
@@ -351,7 +421,7 @@ where
                         yield Ok(RawStreamingChoice::Message(content));
                     }
 
-                    if choice.finish_reason == CompatibleFinishReason::ToolCalls {
+                    if choice.finish_reason.is_tool_calls() {
                         for tool_call in take_finalized_tool_calls(
                             &mut tool_calls,
                             DroppedToolCallContext::ToolCallsFinishReason,
@@ -378,6 +448,13 @@ where
             return;
         }
 
+        if profile.requires_terminal_metadata() && terminal_metadata.is_none() {
+            yield Err(CompletionError::ResponseError(
+                "Provider stream ended without a terminal finish reason".to_owned(),
+            ));
+            return;
+        }
+
         for tool_call in
             take_finalized_tool_calls(&mut tool_calls, DroppedToolCallContext::EndOfStream)
         {
@@ -387,7 +464,7 @@ where
         let final_usage = final_usage.unwrap_or_default();
         record_usage(&span, &final_usage);
         yield Ok(RawStreamingChoice::FinalResponse(
-            profile.build_final_response(final_usage),
+            profile.build_final_response_with_terminal_metadata(final_usage, terminal_metadata),
         ));
     }
     .instrument(instrument_span);
@@ -666,6 +743,27 @@ mod tests {
         FinishReasonCleanupProfile,
     };
     use futures::StreamExt;
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn sse_error_detector_handles_null_empty_and_object_or_string_errors() {
@@ -698,6 +796,39 @@ mod tests {
         assert_eq!(error.provider_response_body(), Some(body));
         // It arrives mid-stream with no HTTP status attached.
         assert_eq!(error.provider_response_status(), None);
+    }
+
+    #[test]
+    fn sse_error_warning_does_not_log_provider_message() {
+        use super::provider_response_from_compatible_sse_data as detect;
+
+        let _isolation = crate::test_utils::scoped_tracing_subscriber_guard_blocking();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let captured = captured.clone();
+                move || SharedLogWriter(captured.clone())
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let sentinel = "provider-secret-sentinel";
+        let payload = format!(r#"{{"error":{{"message":"{sentinel}","type":"provider_error"}}}}"#);
+
+        let error = detect(&payload).expect("object error envelope should be detected");
+        let logs = String::from_utf8(
+            captured
+                .lock()
+                .expect("log buffer mutex should not be poisoned")
+                .clone(),
+        )
+        .expect("captured logs should be UTF-8");
+
+        assert_eq!(error.provider_response_body(), Some(payload.as_str()));
+        assert!(logs.contains("provider returned a streaming error event"));
+        assert!(!logs.contains(sentinel));
     }
 
     #[test]
@@ -1154,7 +1285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_non_http_transport_error_stays_provider_error() {
+    async fn streaming_non_http_transport_error_stays_http_error() {
         use crate::test_utils::SequencedStreamingHttpClient;
 
         use crate::providers::openai::send_compatible_streaming_request;
@@ -1180,10 +1311,10 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "ProviderError: Invalid content type was returned: \"application/json\""
+            "HttpError: Invalid content type was returned: \"application/json\""
         );
-        assert!(matches!(err, CompletionError::ProviderError(_)));
-        // Rig-generated transport diagnostics are not provider response bodies.
+        assert!(matches!(err, CompletionError::HttpError(_)));
+        // Status-less transport failures are not provider responses.
         assert_eq!(err.provider_response_body(), None);
         assert_eq!(err.provider_response_status(), None);
     }

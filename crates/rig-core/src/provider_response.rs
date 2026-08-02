@@ -60,10 +60,10 @@ pub(crate) fn completion_error_from_body(
 ///
 /// The enum must have a `ProviderResponse(`[`ProviderResponseError`]`)` variant
 /// and an `HttpError(`[`http_client::Error`](crate::http_client::Error)`)`
-/// variant; the generated helpers read from those two sources only, since they
-/// are the only ones that genuinely represent a provider's response.
+/// variant. An optional `http_variant` can name another variant that carries an
+/// HTTP error, such as a classified authentication failure.
 macro_rules! impl_provider_response_helpers {
-    ($error:ty) => {
+    ($error:ty $(, http_variant = $http_variant:ident)?) => {
         impl $error {
             /// Builds an error from a captured HTTP status and raw response body,
             /// routing it so the `provider_response_*` helpers stay useful.
@@ -123,7 +123,9 @@ macro_rules! impl_provider_response_helpers {
             pub fn provider_response_body(&self) -> Option<&str> {
                 match self {
                     Self::ProviderResponse(response) => Some(response.body.as_str()),
-                    Self::HttpError(error) => error.non_success_body(),
+                    Self::HttpError(error) $(| Self::$http_variant(error))? => {
+                        error.non_success_body()
+                    }
                     _ => None,
                 }
             }
@@ -153,7 +155,9 @@ macro_rules! impl_provider_response_helpers {
             pub fn provider_response_status(&self) -> Option<http::StatusCode> {
                 match self {
                     Self::ProviderResponse(response) => response.status,
-                    Self::HttpError(error) => error.non_success_status(),
+                    Self::HttpError(error) $(| Self::$http_variant(error))? => {
+                        error.non_success_status()
+                    }
                     _ => None,
                 }
             }

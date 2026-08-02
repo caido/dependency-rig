@@ -189,7 +189,7 @@ impl TryFrom<RigMessage> for Vec<Message> {
         fn reasoning_item(
             reasoning: crate::message::Reasoning,
         ) -> Result<Message, CompletionError> {
-            let crate::message::Reasoning { id, content } = reasoning;
+            let crate::message::Reasoning { id, content, .. } = reasoning;
             let id = id.ok_or_else(|| {
                 CompletionError::RequestError(
                     "Assistant reasoning `id` is required for xAI Responses replay".into(),
@@ -404,6 +404,7 @@ mod tests {
             content: vec![ReasoningContent::Redacted {
                 data: "opaque-redacted".to_string(),
             }],
+            additional_params: None,
         };
         let message = RigMessage::Assistant {
             id: Some("assistant_1".to_string()),
@@ -435,6 +436,7 @@ mod tests {
                     data: "opaque-redacted".to_string(),
                 },
             ],
+            additional_params: None,
         };
         let message = RigMessage::Assistant {
             id: Some("assistant_2".to_string()),
@@ -465,6 +467,7 @@ mod tests {
         let reasoning = Reasoning {
             id: Some("rs_empty".to_string()),
             content: vec![],
+            additional_params: None,
         };
         let message = RigMessage::Assistant {
             id: Some("assistant_2b".to_string()),

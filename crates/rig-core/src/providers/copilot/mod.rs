@@ -675,6 +675,7 @@ impl TryFrom<ChatCompletionResponse> for completion::CompletionResponse<ChatComp
             usage,
             raw_response: response,
             message_id: None,
+            terminal_metadata: None,
         })
     }
 }
@@ -853,6 +854,7 @@ where
                             usage: core.usage,
                             raw_response: CopilotCompletionResponse::Chat(response),
                             message_id: core.message_id,
+                            terminal_metadata: core.terminal_metadata,
                         })
                     }
                     ChatApiResponse::Err(err) => {
@@ -935,6 +937,7 @@ where
                     usage: core.usage,
                     raw_response: CopilotCompletionResponse::Responses(Box::new(response)),
                     message_id: core.message_id,
+                    terminal_metadata: core.terminal_metadata,
                 })
             } else {
                 let body = http_client::text(response).await?;
@@ -1093,8 +1096,8 @@ where
                                                 encrypted_content.as_deref(),
                                             ) {
                                                 match reasoning_choice {
-                                                    RawStreamingChoice::Reasoning { id, content } => {
-                                                        yield Ok(RawStreamingChoice::Reasoning { id, content });
+                                                    RawStreamingChoice::Reasoning { id, content, additional_params } => {
+                                                        yield Ok(RawStreamingChoice::Reasoning { id, content, additional_params });
                                                     }
                                                     RawStreamingChoice::ReasoningDelta { id, reasoning } => {
                                                         yield Ok(RawStreamingChoice::ReasoningDelta { id, reasoning });
@@ -1208,7 +1211,10 @@ where
 
                 yield Ok(RawStreamingChoice::FinalResponse(
                     CopilotStreamingResponse::Responses(
-                        responses_api::streaming::StreamingCompletionResponse { usage: final_usage }
+                        responses_api::streaming::StreamingCompletionResponse {
+                            usage: final_usage,
+                            terminal_metadata: None,
+                        }
                     )
                 ));
             },
@@ -1608,6 +1614,7 @@ impl CompatibleStreamProfile for CopilotChatCompatibleProfile {
     fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse {
         CopilotStreamingResponse::Chat(openai::completion::streaming::StreamingCompletionResponse {
             usage,
+            terminal_metadata: None,
         })
     }
 

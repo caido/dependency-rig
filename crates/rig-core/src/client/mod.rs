@@ -532,12 +532,24 @@ where
             .body(http_client::NoBody)
             .map_err(http_client::Error::from)?;
 
-        let response = self.http_client.send(req).await?;
+        let response = match self.http_client.send(req).await {
+            Err(error) if error.non_success_status() == Some(StatusCode::UNAUTHORIZED) => {
+                return Err(VerifyError::InvalidAuthentication(error));
+            }
+            Err(error) => return Err(VerifyError::HttpError(error)),
+            Ok(response) => response,
+        };
 
         match response.status() {
             StatusCode::OK => Ok(()),
-            StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                Err(VerifyError::InvalidAuthentication)
+            StatusCode::UNAUTHORIZED => {
+                let body = http_client::text(response).await?;
+                Err(VerifyError::InvalidAuthentication(
+                    http_client::Error::InvalidStatusCodeWithMessage(
+                        StatusCode::UNAUTHORIZED,
+                        body,
+                    ),
+                ))
             }
             StatusCode::INTERNAL_SERVER_ERROR => {
                 let text = http_client::text(response).await?;

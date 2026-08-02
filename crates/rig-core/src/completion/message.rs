@@ -95,6 +95,9 @@ pub struct Reasoning {
     pub id: Option<String>,
     /// Ordered reasoning content blocks.
     pub content: Vec<ReasoningContent>,
+    /// Provider-specific metadata required to replay the reasoning item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_params: Option<serde_json::Value>,
 }
 
 impl Reasoning {
@@ -111,6 +114,7 @@ impl Reasoning {
                 text: input.to_string(),
                 signature,
             }],
+            additional_params: None,
         }
     }
 
@@ -137,6 +141,7 @@ impl Reasoning {
                     signature: None,
                 })
                 .collect(),
+            additional_params: None,
         }
     }
 
@@ -145,6 +150,7 @@ impl Reasoning {
         Self {
             id: None,
             content: vec![ReasoningContent::Redacted { data: data.into() }],
+            additional_params: None,
         }
     }
 
@@ -153,6 +159,7 @@ impl Reasoning {
         Self {
             id: None,
             content: vec![ReasoningContent::Encrypted(data.into())],
+            additional_params: None,
         }
     }
 
@@ -161,7 +168,14 @@ impl Reasoning {
         Self {
             id: None,
             content: input.into_iter().map(ReasoningContent::Summary).collect(),
+            additional_params: None,
         }
+    }
+
+    /// Attach provider-specific metadata required to replay this reasoning item.
+    pub fn with_additional_params(mut self, additional_params: serde_json::Value) -> Self {
+        self.additional_params = Some(additional_params);
+        self
     }
 
     /// Render reasoning as displayable text by joining text-like blocks with newlines.

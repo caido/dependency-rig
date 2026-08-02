@@ -9,7 +9,7 @@ use super::completion::gemini_api_types::{
 };
 use super::completion::{
     CompletionModel, create_request_body, function_call_finish_reason_error, resolve_request_model,
-    streaming_endpoint,
+    streaming_endpoint, terminal_metadata_from_finish_reason,
 };
 use crate::completion::message::ReasoningContent;
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
@@ -50,11 +50,16 @@ impl GetTokenUsage for PartialUsage {
         let mut usage = crate::completion::Usage::new();
 
         usage.input_tokens = self.prompt_token_count as u64;
-        usage.output_tokens = self.candidates_token_count.unwrap_or_default() as u64;
         usage.cached_input_tokens = self.cached_content_token_count.unwrap_or_default() as u64;
         usage.reasoning_tokens = self.thoughts_token_count.unwrap_or_default() as u64;
+        usage.output_tokens =
+            self.candidates_token_count.unwrap_or_default() as u64 + usage.reasoning_tokens;
         usage.tool_use_prompt_tokens = self.tool_use_prompt_token_count.unwrap_or_default() as u64;
-        usage.total_tokens = self.total_token_count as u64;
+        usage.total_tokens = if self.total_token_count == 0 {
+            usage.input_tokens + usage.output_tokens
+        } else {
+            self.total_token_count as u64
+        };
 
         usage
     }
@@ -80,11 +85,17 @@ pub struct StreamingCompletionResponse {
     pub finish_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_metadata: Option<crate::completion::CompletionTerminalMetadata>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> crate::completion::Usage {
         self.usage_metadata.token_usage()
+    }
+
+    fn terminal_metadata(&self) -> Option<crate::completion::CompletionTerminalMetadata> {
+        self.terminal_metadata.clone()
     }
 }
 
@@ -149,6 +160,7 @@ where
             let mut final_finish_reason: Option<FinishReason> = None;
             let mut final_finish_message: Option<String> = None;
             let mut final_model_version: Option<String> = None;
+            let mut saw_tool_call = false;
             let mut stream_failed = false;
             while let Some(event_result) = event_source.next().await {
                 match event_result {
@@ -160,6 +172,9 @@ where
                         // Skip heartbeat messages or empty data
                         if message.data.trim().is_empty() {
                             continue;
+                        }
+                        if message.data == "[DONE]" {
+                            break;
                         }
 
                         let data = match serde_json::from_str::<StreamGenerateContentResponse>(&message.data) {
@@ -239,6 +254,7 @@ where
                                                     text,
                                                     signature: thought_signature,
                                                 },
+                                                additional_params: None,
                                             });
                                         } else {
                                             yield Ok(streaming::RawStreamingChoice::ReasoningDelta {
@@ -261,6 +277,7 @@ where
                                     thought_signature,
                                     ..
                                 } => {
+                                    saw_tool_call = true;
                                     yield Ok(streaming::RawStreamingChoice::ToolCall(
                                         streaming::RawStreamingToolCall::new(function_call.name.clone(), function_call.name.clone(), function_call.args.clone())
                                             .with_signature(thought_signature)
@@ -292,14 +309,26 @@ where
             // Ensure event source is closed when stream ends
             event_source.close();
 
-            if !stream_failed {
-                yield Ok(streaming::RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                    usage_metadata: final_usage.unwrap_or_default(),
-                    finish_reason: final_finish_reason,
-                    finish_message: final_finish_message,
-                    model_version: final_model_version,
-                }));
+            if stream_failed {
+                return;
             }
+
+            let Some(finish_reason) = final_finish_reason else {
+                yield Err(CompletionError::ResponseError(
+                    "Gemini stream ended without a terminal finish_reason".to_owned(),
+                ));
+                return;
+            };
+            let terminal_metadata =
+                terminal_metadata_from_finish_reason(Some(&finish_reason), saw_tool_call);
+
+            yield Ok(streaming::RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
+                usage_metadata: final_usage.unwrap_or_default(),
+                finish_reason: Some(finish_reason),
+                finish_message: final_finish_message,
+                model_version: final_model_version,
+                terminal_metadata,
+            }));
         }.instrument(span);
 
         Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
@@ -311,6 +340,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::CompletionClient;
+    use crate::completion::CompletionModel as _;
+    use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
+    use crate::streaming::StreamedAssistantContent;
+    use crate::test_utils::MockStreamingClient;
+    use futures::StreamExt;
     use serde_json::json;
 
     #[test]
@@ -683,7 +718,7 @@ mod tests {
         let token_usage = usage.token_usage();
         assert_eq!(token_usage.input_tokens, 40);
         assert_eq!(token_usage.cached_input_tokens, 20);
-        assert_eq!(token_usage.output_tokens, 30);
+        assert_eq!(token_usage.output_tokens, 40);
         assert_eq!(token_usage.reasoning_tokens, 10);
         assert_eq!(token_usage.tool_use_prompt_tokens, 12);
         assert_eq!(token_usage.total_tokens, 100);
@@ -692,7 +727,7 @@ mod tests {
     #[test]
     fn test_partial_usage_with_missing_counts() {
         let usage = PartialUsage {
-            total_token_count: 50,
+            total_token_count: 0,
             cached_content_token_count: None,
             candidates_token_count: Some(30),
             thoughts_token_count: None,
@@ -732,6 +767,10 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             finish_message: None,
             model_version: Some("gemini-2.5-pro-preview-05-06".to_string()),
+            terminal_metadata: terminal_metadata_from_finish_reason(
+                Some(&FinishReason::Stop),
+                false,
+            ),
         };
 
         assert!(matches!(response.finish_reason, Some(FinishReason::Stop)));
@@ -750,6 +789,92 @@ mod tests {
             deserialized.model_version.as_deref(),
             Some("gemini-2.5-pro-preview-05-06")
         );
+    }
+
+    #[tokio::test]
+    async fn stream_without_finish_reason_ends_with_response_error() {
+        let client = crate::providers::gemini::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[json!({
+                    "responseId": "resp_truncated",
+                    "candidates": [{
+                        "content": {
+                            "parts": [{"text": "partial"}],
+                            "role": "model"
+                        },
+                        "index": 0
+                    }]
+                })]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gemini-2.5-flash");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut saw_partial = false;
+        let mut terminal_error = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamedAssistantContent::Text(text)) if text.text == "partial" => {
+                    saw_partial = true;
+                }
+                Err(error) => terminal_error = Some(error),
+                _ => {}
+            }
+        }
+
+        assert!(saw_partial);
+        assert!(matches!(
+            terminal_error,
+            Some(CompletionError::ResponseError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn streamed_stop_with_function_call_normalizes_to_tool_calls() {
+        let client = crate::providers::gemini::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[json!({
+                    "responseId": "resp_tool_call",
+                    "candidates": [{
+                        "content": {
+                            "parts": [{
+                                "functionCall": {
+                                    "name": "lookup",
+                                    "args": {"query": "rust"}
+                                }
+                            }],
+                            "role": "model"
+                        },
+                        "finishReason": "STOP",
+                        "index": 0
+                    }]
+                })]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gemini-2.5-flash");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut terminal = None;
+
+        while let Some(item) = stream.next().await {
+            if let StreamedAssistantContent::Final(response) =
+                item.expect("complete stream should not error")
+            {
+                terminal = response.terminal_metadata();
+            }
+        }
+
+        let terminal = terminal.expect("stream should expose terminal metadata");
+        assert_eq!(
+            terminal.reason(),
+            crate::completion::CompletionFinishReason::ToolCalls
+        );
+        assert_eq!(terminal.raw_reason(), Some("STOP"));
     }
 
     #[test]
@@ -771,6 +896,10 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             finish_message: None,
             model_version: Some("gemini-2.0-flash-001".to_string()),
+            terminal_metadata: terminal_metadata_from_finish_reason(
+                Some(&FinishReason::Stop),
+                false,
+            ),
         };
 
         let token_usage = response.token_usage();
@@ -831,7 +960,7 @@ mod tests {
         let token_usage = usage.token_usage();
         assert_eq!(token_usage.input_tokens, 100);
         assert_eq!(token_usage.cached_input_tokens, 25);
-        assert_eq!(token_usage.output_tokens, 50);
+        assert_eq!(token_usage.output_tokens, 65);
         assert_eq!(token_usage.reasoning_tokens, 15);
         assert_eq!(token_usage.tool_use_prompt_tokens, 12);
         assert_eq!(token_usage.total_tokens, 190);

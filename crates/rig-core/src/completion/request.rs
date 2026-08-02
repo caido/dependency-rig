@@ -125,17 +125,13 @@ pub enum CompletionError {
 crate::provider_response::impl_provider_response_helpers!(CompletionError);
 
 impl CompletionError {
-    /// Maps an SSE transport error into a completion error without flattening HTTP failures.
+    /// Maps an SSE transport error without losing its transport classification.
     ///
-    /// Non-success HTTP responses remain [`CompletionError::HttpError`] so provider response
-    /// helpers can read status and body. Other transport failures keep the existing
-    /// [`CompletionError::ProviderError`] display string behavior.
+    /// Status-bearing HTTP failures remain inspectable through the provider response
+    /// helpers, while status-less connection, timeout, and decoder failures remain
+    /// [`CompletionError::HttpError`] values with their original source attached.
     pub(crate) fn from_stream_transport(error: http_client::Error) -> Self {
-        if error.non_success_status().is_some() {
-            Self::HttpError(error)
-        } else {
-            Self::ProviderError(error.to_string())
-        }
+        Self::HttpError(error)
     }
 }
 
@@ -496,6 +492,67 @@ pub struct CompletionResponse<T> {
     /// Provider-assigned message ID (e.g. OpenAI Responses API `msg_` ID).
     /// Used to pair reasoning input items with their output items in multi-turn.
     pub message_id: Option<String>,
+    /// Provider-independent reason this successful completion ended.
+    ///
+    /// `None` means the provider did not report a terminal reason. The exact
+    /// provider reason remains available through [`Self::raw_response`] and,
+    /// when supplied as a string, [`CompletionTerminalMetadata::raw_reason`].
+    pub terminal_metadata: Option<CompletionTerminalMetadata>,
+}
+
+/// Provider-independent reason a successful completion ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CompletionFinishReason {
+    /// The model completed normally or matched a configured stop sequence.
+    Stop,
+    /// The provider stopped at a token, output, or context limit.
+    Length,
+    /// The model completed the turn by emitting one or more tool calls.
+    ToolCalls,
+    /// The provider stopped or blocked output for safety or content filtering.
+    ContentFilter,
+    /// The provider supplied a terminal reason Rig does not recognize.
+    Unknown,
+}
+
+/// Canonical metadata describing why a successful completion ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompletionTerminalMetadata {
+    /// Normalized provider-independent terminal reason.
+    pub reason: CompletionFinishReason,
+    /// Exact provider reason string, when one was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_reason: Option<String>,
+}
+
+impl CompletionTerminalMetadata {
+    /// Create terminal metadata without a provider-specific reason string.
+    pub fn new(reason: CompletionFinishReason) -> Self {
+        Self {
+            reason,
+            raw_reason: None,
+        }
+    }
+
+    /// Attach the exact reason string supplied by the provider.
+    pub fn with_raw_reason(mut self, raw_reason: impl Into<String>) -> Self {
+        self.raw_reason = Some(raw_reason.into());
+        self
+    }
+
+    /// Return the provider-independent terminal category.
+    pub fn reason(&self) -> CompletionFinishReason {
+        self.reason
+    }
+
+    /// Return the exact provider reason string, when available.
+    pub fn raw_reason(&self) -> Option<&str> {
+        self.raw_reason.as_deref()
+    }
 }
 
 /// A trait for grabbing the token usage of a completion response.
@@ -506,6 +563,11 @@ pub trait GetTokenUsage {
     /// [`Usage`]'s documented sentinel for missing provider usage metrics;
     /// response types that carry no usage return [`Usage::new`].
     fn token_usage(&self) -> crate::completion::Usage;
+
+    /// Returns normalized terminal metadata when the provider supplied it.
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        None
+    }
 }
 
 impl GetTokenUsage for () {
@@ -524,6 +586,10 @@ where
         } else {
             crate::completion::Usage::new()
         }
+    }
+
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.as_ref().and_then(GetTokenUsage::terminal_metadata)
     }
 }
 
@@ -686,6 +752,8 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u64>,
     /// Whether tools are required to be used by the model provider or not before providing a response.
     pub tool_choice: Option<ToolChoice>,
+    /// Whether the model provider may call multiple tools in parallel.
+    pub parallel_tool_calls: Option<bool>,
     /// Additional provider-specific parameters to be sent to the completion model provider
     pub additional_params: Option<serde_json::Value>,
     /// Optional JSON Schema for structured output. When set, providers that support
@@ -860,6 +928,7 @@ pub struct CompletionRequestBuilder<M: CompletionModel> {
     temperature: Option<f64>,
     max_tokens: Option<u64>,
     tool_choice: Option<ToolChoice>,
+    parallel_tool_calls: Option<bool>,
     additional_params: Option<serde_json::Value>,
     output_schema: Option<schemars::Schema>,
 }
@@ -878,6 +947,7 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         }
@@ -1019,6 +1089,18 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
         self
     }
 
+    /// Sets whether the model provider may call multiple tools in parallel.
+    pub fn parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
+        self.parallel_tool_calls = Some(parallel_tool_calls);
+        self
+    }
+
+    /// Sets whether the model provider may call multiple tools in parallel.
+    pub fn parallel_tool_calls_opt(mut self, parallel_tool_calls: Option<bool>) -> Self {
+        self.parallel_tool_calls = parallel_tool_calls;
+        self
+    }
+
     /// Sets the output schema for structured output. When set, providers that support
     /// native structured outputs will constrain the model's response to match this schema.
     /// NOTE: For direct type conversion, you may want to use `Agent::prompt_typed()` - using this method
@@ -1067,6 +1149,7 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             additional_params,
             output_schema: self.output_schema,
         }
@@ -1106,6 +1189,15 @@ mod tests {
 
     use super::*;
     use crate::test_utils::MockCompletionModel;
+
+    #[test]
+    fn completion_request_builder_sets_parallel_tool_calls() {
+        let request = CompletionRequestBuilder::new(MockCompletionModel::default(), "Hello")
+            .parallel_tool_calls(false)
+            .build();
+
+        assert_eq!(request.parallel_tool_calls, Some(false));
+    }
 
     fn test_document(id: &str, text: &str) -> Document {
         Document {
@@ -1185,6 +1277,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1217,6 +1310,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1342,6 +1436,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1375,6 +1470,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1412,6 +1508,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -1488,6 +1585,35 @@ mod tests {
                 .expect("no body is not an error"),
             None
         );
+    }
+
+    #[test]
+    fn stream_transport_error_remains_http_error_without_provider_response_metadata() {
+        let error = CompletionError::from_stream_transport(http_client::Error::InvalidContentType(
+            http::HeaderValue::from_static("application/json"),
+        ));
+
+        assert!(matches!(error, CompletionError::HttpError(_)));
+        assert_eq!(error.provider_response_body(), None);
+        assert_eq!(error.provider_response_status(), None);
+    }
+
+    #[test]
+    fn stream_http_failure_preserves_unavailable_status_and_body() {
+        let body = r#"{"error":{"message":"temporarily unavailable"}}"#;
+        let error = CompletionError::from_stream_transport(
+            http_client::Error::InvalidStatusCodeWithMessage(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                body.to_string(),
+            ),
+        );
+
+        assert!(matches!(error, CompletionError::HttpError(_)));
+        assert_eq!(
+            error.provider_response_status(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(error.provider_response_body(), Some(body));
     }
 
     #[test]

@@ -392,6 +392,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                     },
                     raw_response,
                     message_id: None,
+                    terminal_metadata: None,
                 })
             }
             _ => Err(CompletionError::ResponseError(
@@ -1684,6 +1685,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: Some(json!({
                 "think": true,
                 "keep_alive": "-1m",
@@ -1750,6 +1752,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: Some(json!({
                 "think": "low",
                 "keep_alive": "-1m",
@@ -1816,6 +1819,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: Some(json!({
                 "think": "medium",
                 "keep_alive": "-1m",
@@ -1882,6 +1886,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: Some(json!({
                 "think": "high",
                 "keep_alive": "-1m",
@@ -1948,6 +1953,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: Some(json!({
                 "think": "invalid",
                 "keep_alive": "-1m",
@@ -1981,6 +1987,7 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -2046,6 +2053,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: Some(schema),
         };
@@ -2089,6 +2097,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };

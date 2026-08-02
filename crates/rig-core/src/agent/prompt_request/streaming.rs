@@ -570,6 +570,7 @@ where
                         runner.max_tokens,
                         runner.additional_params.as_ref(),
                         runner.tool_choice.as_ref(),
+                        runner.parallel_tool_calls,
                         &runner.tool_server_handle,
                         &runner.dynamic_context,
                         runner.output_schema.as_ref(),
@@ -1526,6 +1527,9 @@ mod tests {
                 text: "step-1".to_string(),
                 signature: Some("sig-1".to_string()),
             }],
+            additional_params: Some(serde_json::json!({
+                "reasoning_details": [{"index": 0, "type": "reasoning.text"}]
+            })),
         };
         let second = crate::message::Reasoning {
             id: Some("rs_1".to_string()),
@@ -1536,6 +1540,12 @@ mod tests {
                 },
                 ReasoningContent::Summary("summary".to_string()),
             ],
+            additional_params: Some(serde_json::json!({
+                "reasoning_details": [
+                    {"index": 1, "type": "reasoning.text"},
+                    {"index": 2, "type": "reasoning.summary"}
+                ]
+            })),
         };
 
         merge_reasoning_blocks(&mut accumulated, &first);
@@ -1545,6 +1555,16 @@ mod tests {
         let merged = accumulated.first().expect("expected accumulated reasoning");
         assert_eq!(merged.id.as_deref(), Some("rs_1"));
         assert_eq!(merged.content.len(), 3);
+        assert_eq!(
+            merged.additional_params,
+            Some(serde_json::json!({
+                "reasoning_details": [
+                    {"index": 0, "type": "reasoning.text"},
+                    {"index": 1, "type": "reasoning.text"},
+                    {"index": 2, "type": "reasoning.summary"}
+                ]
+            }))
+        );
         assert!(matches!(
             merged.content.first(),
             Some(ReasoningContent::Text { text, signature: Some(sig) })
@@ -1565,6 +1585,7 @@ mod tests {
                 text: "step-1".to_string(),
                 signature: None,
             }],
+            additional_params: None,
         }];
         let incoming = crate::message::Reasoning {
             id: Some("rs_b".to_string()),
@@ -1572,6 +1593,7 @@ mod tests {
                 text: "step-2".to_string(),
                 signature: None,
             }],
+            additional_params: None,
         };
 
         merge_reasoning_blocks(&mut accumulated, &incoming);
@@ -1594,6 +1616,7 @@ mod tests {
                 text: "first".to_string(),
                 signature: None,
             }],
+            additional_params: None,
         }];
         let incoming = crate::message::Reasoning {
             id: None,
@@ -1601,6 +1624,7 @@ mod tests {
                 text: "second".to_string(),
                 signature: None,
             }],
+            additional_params: None,
         };
 
         merge_reasoning_blocks(&mut accumulated, &incoming);
@@ -1609,7 +1633,8 @@ mod tests {
             accumulated.first(),
             Some(crate::message::Reasoning {
                 id: None,
-                content
+                content,
+                ..
             }) if matches!(
                 content.first(),
                 Some(ReasoningContent::Text { text, .. }) if text == "first"
@@ -1619,7 +1644,8 @@ mod tests {
             accumulated.get(1),
             Some(crate::message::Reasoning {
                 id: None,
-                content
+                content,
+                ..
             }) if matches!(
                 content.first(),
                 Some(ReasoningContent::Text { text, .. }) if text == "second"

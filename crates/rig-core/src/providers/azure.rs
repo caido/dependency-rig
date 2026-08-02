@@ -1256,6 +1256,7 @@ mod azure_tests {
                 temperature: Some(0.0),
                 tools: vec![],
                 tool_choice: None,
+                parallel_tool_calls: None,
                 additional_params: None,
                 output_schema: None,
             })
@@ -1323,6 +1324,7 @@ mod azure_tests {
                 temperature: Some(0.0),
                 tools: vec![],
                 tool_choice: None,
+                parallel_tool_calls: None,
                 additional_params: None,
                 output_schema: None,
             })

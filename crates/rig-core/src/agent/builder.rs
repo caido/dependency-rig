@@ -117,6 +117,8 @@ where
     temperature: Option<f64>,
     /// Whether or not the underlying LLM should be forced to use a tool before providing a response.
     tool_choice: Option<ToolChoice>,
+    /// Whether the model provider may call multiple tools in parallel.
+    parallel_tool_calls: Option<bool>,
     /// Default maximum depth for multi-turn agent calls
     default_max_turns: Option<usize>,
     /// Tool configuration state (typestate pattern)
@@ -192,6 +194,12 @@ where
     /// Set the tool choice for the agent
     pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    /// Set whether the model provider may call multiple tools in parallel.
+    pub fn parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
+        self.parallel_tool_calls = Some(parallel_tool_calls);
         self
     }
 
@@ -298,6 +306,7 @@ where
             additional_params: None,
             dynamic_context: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             default_max_turns: None,
             tool_state: NoToolConfig,
             hooks: HookStack::new(),
@@ -333,6 +342,7 @@ where
             dynamic_context: self.dynamic_context,
             temperature: self.temperature,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             default_max_turns: self.default_max_turns,
             tool_state: WithToolServerHandle { handle },
             hooks: self.hooks,
@@ -360,6 +370,7 @@ where
             dynamic_context: self.dynamic_context,
             temperature: self.temperature,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             default_max_turns: self.default_max_turns,
             tool_state: WithBuilderTools {
                 static_tools: vec![toolname],
@@ -393,6 +404,7 @@ where
             dynamic_context: self.dynamic_context,
             temperature: self.temperature,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             default_max_turns: self.default_max_turns,
             hooks: self.hooks,
             output_schema: self.output_schema,
@@ -494,6 +506,7 @@ where
             dynamic_context: self.dynamic_context,
             temperature: self.temperature,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             default_max_turns: self.default_max_turns,
             hooks: self.hooks,
             output_schema: self.output_schema,
@@ -529,6 +542,7 @@ where
             dynamic_context: self.dynamic_context,
             temperature: self.temperature,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             default_max_turns: self.default_max_turns,
             hooks: self.hooks,
             output_schema: self.output_schema,
@@ -559,6 +573,7 @@ where
             max_tokens: self.max_tokens,
             additional_params: self.additional_params,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             dynamic_context: Arc::new(self.dynamic_context),
             tool_server_handle,
             default_max_turns: self.default_max_turns,
@@ -587,6 +602,7 @@ where
             max_tokens: self.max_tokens,
             additional_params: self.additional_params,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             dynamic_context: Arc::new(self.dynamic_context),
             tool_server_handle: self.tool_state.handle,
             default_max_turns: self.default_max_turns,
@@ -697,6 +713,7 @@ where
             max_tokens: self.max_tokens,
             additional_params: self.additional_params,
             tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             dynamic_context: Arc::new(self.dynamic_context),
             tool_server_handle,
             default_max_turns: self.default_max_turns,
@@ -718,6 +735,15 @@ mod tests {
     struct BuilderHook;
 
     impl AgentHook<MockCompletionModel> for BuilderHook {}
+
+    #[test]
+    fn builder_sets_parallel_tool_call_policy() {
+        let agent = AgentBuilder::new(MockCompletionModel::text("ok"))
+            .parallel_tool_calls(false)
+            .build();
+
+        assert_eq!(agent.parallel_tool_calls, Some(false));
+    }
 
     #[test]
     fn hook_can_be_set_after_tool_configuration() {

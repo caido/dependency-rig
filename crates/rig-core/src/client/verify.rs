@@ -7,14 +7,14 @@ use thiserror::Error;
 /// [`Self::provider_response_json`], and [`Self::provider_response_status`].
 ///
 /// Note: no provider path currently constructs [`Self::ProviderResponse`] for
-/// verification; real verify failures surface as [`Self::HttpError`], which
-/// the helpers read. The variant is kept for symmetry with the other capability
-/// errors and for future provider paths that preserve a 2xx error envelope.
+/// verification. Authentication failures surface as [`Self::InvalidAuthentication`]
+/// with their original HTTP error attached, while other verify failures surface
+/// as [`Self::HttpError`]. The provider response helpers inspect both variants.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum VerifyError {
-    #[error("invalid authentication")]
-    InvalidAuthentication,
+    #[error("invalid authentication: {0}")]
+    InvalidAuthentication(#[source] http_client::Error),
     #[error("provider error: {0}")]
     ProviderError(String),
     /// Raw error response preserved from the provider
@@ -28,7 +28,10 @@ pub enum VerifyError {
     ),
 }
 
-crate::provider_response::impl_provider_response_helpers!(VerifyError);
+crate::provider_response::impl_provider_response_helpers!(
+    VerifyError,
+    http_variant = InvalidAuthentication
+);
 
 /// A provider client that can verify the configuration.
 /// Clone is required for conversions between client types.
@@ -99,7 +102,7 @@ mod provider_response_tests {
 
     #[test]
     fn verify_error_provider_response_helpers_with_unrelated_variant() {
-        let error = VerifyError::InvalidAuthentication;
+        let error = VerifyError::ProviderError("invalid authentication".to_string());
 
         assert_eq!(error.provider_response_body(), None);
         assert_eq!(error.provider_response_status(), None);
@@ -136,5 +139,63 @@ mod provider_response_tests {
             .expect("raw body should be valid JSON")
             .expect("parsed JSON should be present");
         assert_eq!(json["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn verify_normalizes_only_unauthorized_as_invalid_authentication() {
+        use crate::client::VerifyClient;
+        use crate::providers::openai::Client;
+        use crate::test_utils::RecordingHttpClient;
+
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(RecordingHttpClient::with_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid API key",
+            ))
+            .build()
+            .expect("build client");
+
+        let error = client
+            .verify()
+            .await
+            .expect_err("verify should reject a 401 response");
+
+        let VerifyError::InvalidAuthentication(source) = &error else {
+            panic!("401 should normalize to invalid authentication");
+        };
+        assert_eq!(source.non_success_status(), Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(source.non_success_body(), Some("invalid API key"));
+        assert_eq!(
+            error.provider_response_status(),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(error.provider_response_body(), Some("invalid API key"));
+    }
+
+    #[tokio::test]
+    async fn verify_preserves_forbidden_status_instead_of_normalizing_authentication() {
+        use crate::client::VerifyClient;
+        use crate::providers::openai::Client;
+        use crate::test_utils::RecordingHttpClient;
+
+        let body = r#"{"error":{"message":"access denied by policy"}}"#;
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(RecordingHttpClient::with_error(StatusCode::FORBIDDEN, body))
+            .build()
+            .expect("build client");
+
+        let error = client
+            .verify()
+            .await
+            .expect_err("verify should reject a 403 response");
+
+        assert!(matches!(error, VerifyError::HttpError(_)));
+        assert_eq!(
+            error.provider_response_status(),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(error.provider_response_body(), Some(body));
     }
 }

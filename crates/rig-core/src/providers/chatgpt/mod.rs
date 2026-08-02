@@ -725,6 +725,7 @@ data: [DONE]"#;
             temperature: None,
             max_tokens: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         };
@@ -757,6 +758,7 @@ data: [DONE]"#;
                 temperature: Some(0.5),
                 max_tokens: None,
                 tool_choice: None,
+                parallel_tool_calls: None,
                 additional_params: None,
                 output_schema: None,
             })

@@ -82,6 +82,7 @@ fn finalize_reasoning(
             text: state.content,
             signature: state.signature,
         },
+        additional_params: None,
     })
 }
 
@@ -574,7 +575,7 @@ mod tests {
 
         let choice = finalize_reasoning(state).expect("should emit reasoning");
         match choice {
-            RawStreamingChoice::Reasoning { id, content } => {
+            RawStreamingChoice::Reasoning { id, content, .. } => {
                 assert!(id.is_none());
                 match content {
                     ReasoningContent::Text { text, signature } => {

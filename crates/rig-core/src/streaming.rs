@@ -116,6 +116,8 @@ where
         id: Option<String>,
         /// Complete reasoning content block.
         content: ReasoningContent,
+        /// Provider-specific metadata required to replay the reasoning block.
+        additional_params: Option<serde_json::Value>,
     },
     /// A reasoning partial/delta
     ReasoningDelta {
@@ -378,6 +380,7 @@ where
                     text: text.to_string(),
                     signature: None,
                 }],
+                additional_params: None,
             }));
         self.reasoning_item_index = Some(self.assistant_items.len() - 1);
     }
@@ -414,6 +417,7 @@ where
     R: Clone + Unpin + GetTokenUsage,
 {
     fn from(value: StreamingCompletionResponse<R>) -> CompletionResponse<Option<R>> {
+        let terminal_metadata = value.response.terminal_metadata();
         CompletionResponse {
             choice: value.choice,
             // Derive usage from the final response. `Option<R>: GetTokenUsage`
@@ -422,6 +426,7 @@ where
             usage: value.response.token_usage(),
             raw_response: value.response,
             message_id: value.message_id,
+            terminal_metadata,
         }
     }
 }
@@ -491,17 +496,26 @@ where
                     internal_call_id,
                     content,
                 }))),
-                RawStreamingChoice::Reasoning { id, content } => {
+                RawStreamingChoice::Reasoning {
+                    id,
+                    content,
+                    additional_params,
+                } => {
                     let reasoning = Reasoning {
                         id,
                         content: vec![content],
+                        additional_params,
                     };
                     stream.text_item_index = None;
-                    // Full reasoning block supersedes any delta accumulation
-                    stream.reasoning_item_index = None;
-                    stream
-                        .assistant_items
-                        .push(AssistantContent::Reasoning(reasoning.clone()));
+                    if let Some(index) = stream.reasoning_item_index.take()
+                        && let Some(item) = stream.assistant_items.get_mut(index)
+                    {
+                        *item = AssistantContent::Reasoning(reasoning.clone());
+                    } else {
+                        stream
+                            .assistant_items
+                            .push(AssistantContent::Reasoning(reasoning.clone()));
+                    }
                     Poll::Ready(Some(Ok(StreamedAssistantContent::Reasoning(reasoning))))
                 }
                 RawStreamingChoice::ReasoningDelta { id, reasoning } => {
@@ -753,6 +767,7 @@ mod tests {
                     text: "step one".to_string(),
                     signature: Some("sig_1".to_string()),
                 },
+                additional_params: None,
             });
             yield Ok(RawStreamingChoice::Message("final answer".to_string()));
             yield Ok(RawStreamingChoice::FinalResponse(MockResponse::with_total_tokens(5)));
@@ -766,6 +781,7 @@ mod tests {
             yield Ok(RawStreamingChoice::Reasoning {
                 id: Some("rs_only".to_string()),
                 content: ReasoningContent::Summary("hidden summary".to_string()),
+                additional_params: None,
             });
             yield Ok(RawStreamingChoice::FinalResponse(MockResponse::with_total_tokens(2)));
         };
@@ -781,6 +797,7 @@ mod tests {
                     text: "chain-of-thought".to_string(),
                     signature: None,
                 },
+                additional_params: None,
             });
             yield Ok(RawStreamingChoice::Message("final-text".to_string()));
             yield Ok(RawStreamingChoice::ToolCall(
@@ -964,7 +981,8 @@ mod tests {
             item,
             AssistantContent::Reasoning(Reasoning {
                 id: Some(id),
-                content
+                content,
+                ..
             }) if id == "rs_1"
                 && matches!(
                     content.first(),
@@ -986,6 +1004,55 @@ mod tests {
         assert!(matches!(
             choice_items.first(),
             Some(AssistantContent::Reasoning(Reasoning { id: Some(id), .. })) if id == "rs_only"
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_reasoning_block_replaces_accumulated_deltas() {
+        let stream = stream! {
+            yield Ok(RawStreamingChoice::ReasoningDelta {
+                id: None,
+                reasoning: "step ".to_string(),
+            });
+            yield Ok(RawStreamingChoice::ReasoningDelta {
+                id: None,
+                reasoning: "one".to_string(),
+            });
+            yield Ok(RawStreamingChoice::Reasoning {
+                id: Some("rs_1".to_string()),
+                content: ReasoningContent::Summary("step one".to_string()),
+                additional_params: None,
+            });
+            yield Ok(RawStreamingChoice::Reasoning {
+                id: Some("rs_1".to_string()),
+                content: ReasoningContent::Encrypted("encrypted".to_string()),
+                additional_params: None,
+            });
+            yield Ok(RawStreamingChoice::FinalResponse(MockResponse::with_total_tokens(2)));
+        };
+        let mut stream = StreamingCompletionResponse::stream(to_stream_result(stream));
+
+        while stream.next().await.is_some() {}
+
+        let choice_items: Vec<AssistantContent> = stream.choice.clone().into_iter().collect();
+        assert_eq!(choice_items.len(), 2);
+        assert!(matches!(
+            choice_items.first(),
+            Some(AssistantContent::Reasoning(Reasoning {
+                id: Some(id),
+                content,
+                ..
+            })) if id == "rs_1"
+                && content == &[ReasoningContent::Summary("step one".to_string())]
+        ));
+        assert!(matches!(
+            choice_items.get(1),
+            Some(AssistantContent::Reasoning(Reasoning {
+                id: Some(id),
+                content,
+                ..
+            })) if id == "rs_1"
+                && content == &[ReasoningContent::Encrypted("encrypted".to_string())]
         ));
     }
 

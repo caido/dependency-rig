@@ -134,14 +134,12 @@ impl GetTokenUsage for Usage {
     fn token_usage(&self) -> crate::completion::Usage {
         let mut usage = crate::completion::Usage::new();
 
-        usage.input_tokens = self.input_tokens;
-        usage.output_tokens = self.output_tokens;
         usage.cached_input_tokens = self.cache_read_input_tokens.unwrap_or_default();
         usage.cache_creation_input_tokens = self.cache_creation_input_tokens.unwrap_or_default();
-        usage.total_tokens = self.input_tokens
-            + self.cache_read_input_tokens.unwrap_or_default()
-            + self.cache_creation_input_tokens.unwrap_or_default()
-            + self.output_tokens;
+        usage.input_tokens =
+            self.input_tokens + usage.cached_input_tokens + usage.cache_creation_input_tokens;
+        usage.output_tokens = self.output_tokens;
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
 
         usage
     }
@@ -218,6 +216,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     type Error = CompletionError;
 
     fn try_from(response: CompletionResponse) -> Result<Self, Self::Error> {
+        let terminal_metadata = terminal_metadata_from_stop_reason(response.stop_reason.as_deref());
         let content = response
             .content
             .iter()
@@ -240,26 +239,33 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 .map_err(|_| CompletionError::ResponseError(EMPTY_RESPONSE_ERROR.to_owned()))?
         };
 
-        let usage = completion::Usage {
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            total_tokens: response.usage.input_tokens
-                + response.usage.cache_read_input_tokens.unwrap_or(0)
-                + response.usage.cache_creation_input_tokens.unwrap_or(0)
-                + response.usage.output_tokens,
-            cached_input_tokens: response.usage.cache_read_input_tokens.unwrap_or(0),
-            cache_creation_input_tokens: response.usage.cache_creation_input_tokens.unwrap_or(0),
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
-        };
+        let usage = response.usage.token_usage();
 
         Ok(completion::CompletionResponse {
             choice,
             usage,
             raw_response: response,
             message_id: None,
+            terminal_metadata,
         })
     }
+}
+
+pub(crate) fn terminal_metadata_from_stop_reason(
+    raw_reason: Option<&str>,
+) -> Option<completion::CompletionTerminalMetadata> {
+    let raw_reason = raw_reason?;
+    let reason = match raw_reason {
+        "end_turn" | "stop_sequence" => completion::CompletionFinishReason::Stop,
+        "max_tokens" | "model_context_window_exceeded" => {
+            completion::CompletionFinishReason::Length
+        }
+        "tool_use" => completion::CompletionFinishReason::ToolCalls,
+        "refusal" => completion::CompletionFinishReason::ContentFilter,
+        _ => completion::CompletionFinishReason::Unknown,
+    };
+
+    Some(completion::CompletionTerminalMetadata::new(reason).with_raw_reason(raw_reason))
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -1727,6 +1733,33 @@ impl TryFrom<message::ToolChoice> for ToolChoice {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolChoiceConfig {
+    #[serde(flatten)]
+    choice: ToolChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_parallel_tool_use: Option<bool>,
+}
+
+impl ToolChoiceConfig {
+    fn from_request(
+        tool_choice: Option<message::ToolChoice>,
+        parallel_tool_calls: Option<bool>,
+    ) -> Result<Option<Self>, CompletionError> {
+        if tool_choice.is_none() && parallel_tool_calls.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            choice: tool_choice
+                .map(ToolChoice::try_from)
+                .transpose()?
+                .unwrap_or_default(),
+            disable_parallel_tool_use: parallel_tool_calls.map(|parallel| !parallel),
+        }))
+    }
+}
+
 /// Recursively ensures all object schemas respect Anthropic structured output restrictions:
 /// - `additionalProperties` must be explicitly set to `false` on every object
 /// - All properties must be listed in `required`
@@ -1836,7 +1869,7 @@ pub(super) struct AnthropicCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<ToolChoice>,
+    tool_choice: Option<ToolChoiceConfig>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2378,7 +2411,7 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             max_tokens,
             system,
             temperature: req.temperature,
-            tool_choice: req.tool_choice.map(ToolChoice::try_from).transpose()?,
+            tool_choice: ToolChoiceConfig::from_request(req.tool_choice, req.parallel_tool_calls)?,
             tools,
             output_config,
             // Automatic caching: one top-level field; the API moves the breakpoint automatically.
@@ -3059,9 +3092,63 @@ mod tests {
             temperature: None,
             max_tokens: Some(64),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params,
             output_schema: None,
         }
+    }
+
+    fn serialize_tool_choice(
+        choice: Option<message::ToolChoice>,
+        parallel_tool_calls: Option<bool>,
+    ) -> serde_json::Value {
+        let mut request = completion_request_with_tools(vec![generic_tool("get_weather")], None);
+        request.tool_choice = choice;
+        request.parallel_tool_calls = parallel_tool_calls;
+
+        let request = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+            model: "claude-test",
+            request,
+            prompt_caching: false,
+            automatic_caching: false,
+            automatic_caching_ttl: None,
+        })
+        .expect("request should convert");
+
+        serde_json::to_value(request).expect("request should serialize")["tool_choice"].clone()
+    }
+
+    #[test]
+    fn anthropic_parallel_control_preserves_default_and_named_tool_choices() {
+        assert_eq!(
+            serialize_tool_choice(None, Some(false)),
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+        assert_eq!(
+            serialize_tool_choice(Some(message::ToolChoice::Required), Some(false)),
+            json!({"type": "any", "disable_parallel_tool_use": true})
+        );
+        assert_eq!(
+            serialize_tool_choice(Some(message::ToolChoice::None), Some(false)),
+            json!({"type": "none", "disable_parallel_tool_use": true})
+        );
+        assert_eq!(
+            serialize_tool_choice(
+                Some(message::ToolChoice::Specific {
+                    function_names: vec!["get_weather".to_string()],
+                }),
+                Some(true),
+            ),
+            json!({
+                "type": "tool",
+                "name": "get_weather",
+                "disable_parallel_tool_use": false
+            })
+        );
+        assert_eq!(
+            serialize_tool_choice(Some(message::ToolChoice::Required), None),
+            json!({"type": "any"})
+        );
     }
 
     fn completion_request_with_history(
@@ -3077,6 +3164,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(64),
             tool_choice: None,
+            parallel_tool_calls: None,
             additional_params: None,
             output_schema: None,
         }
@@ -4885,6 +4973,7 @@ mod tests {
                     data: "redacted block".to_string(),
                 },
             ],
+            additional_params: None,
         };
 
         let msg = message::Message::Assistant {
@@ -4941,6 +5030,7 @@ mod tests {
             content: vec![message::ReasoningContent::Encrypted(
                 "ciphertext".to_string(),
             )],
+            additional_params: None,
         };
         let msg = message::Message::Assistant {
             id: None,
@@ -4983,6 +5073,55 @@ mod tests {
             parsed.choice.first(),
             completion::AssistantContent::Text(text) if text.text.is_empty()
         ));
+        let terminal = parsed
+            .terminal_metadata
+            .expect("end_turn should produce terminal metadata");
+        assert_eq!(terminal.reason(), completion::CompletionFinishReason::Stop);
+        assert_eq!(terminal.raw_reason(), Some("end_turn"));
+    }
+
+    #[test]
+    fn stop_reasons_map_to_terminal_metadata() {
+        for (raw, expected) in [
+            ("end_turn", completion::CompletionFinishReason::Stop),
+            ("stop_sequence", completion::CompletionFinishReason::Stop),
+            ("max_tokens", completion::CompletionFinishReason::Length),
+            (
+                "model_context_window_exceeded",
+                completion::CompletionFinishReason::Length,
+            ),
+            ("tool_use", completion::CompletionFinishReason::ToolCalls),
+            ("refusal", completion::CompletionFinishReason::ContentFilter),
+            ("pause_turn", completion::CompletionFinishReason::Unknown),
+            (
+                "future_stop_reason",
+                completion::CompletionFinishReason::Unknown,
+            ),
+        ] {
+            let metadata = terminal_metadata_from_stop_reason(Some(raw))
+                .expect("supplied stop reason should produce metadata");
+            assert_eq!(metadata.reason(), expected);
+            assert_eq!(metadata.raw_reason(), Some(raw));
+        }
+
+        assert_eq!(terminal_metadata_from_stop_reason(None), None);
+    }
+
+    #[test]
+    fn usage_normalizes_cache_tokens_as_input_subsets() {
+        let usage = Usage {
+            input_tokens: 11,
+            cache_read_input_tokens: Some(7),
+            cache_creation_input_tokens: Some(5),
+            output_tokens: 3,
+        }
+        .token_usage();
+
+        assert_eq!(usage.input_tokens, 23);
+        assert_eq!(usage.cached_input_tokens, 7);
+        assert_eq!(usage.cache_creation_input_tokens, 5);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 26);
     }
 
     #[test]
