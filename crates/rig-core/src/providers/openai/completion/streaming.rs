@@ -8,8 +8,8 @@ use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
 use crate::http_client::HttpClientExt;
 use crate::json_utils::{self, merge};
 use crate::providers::internal::openai_chat_completions_compatible::{
-    self, CompatibleChoiceData, CompatibleChunk, CompatibleFinishReason, CompatibleStreamProfile,
-    CompatibleToolCallChunk,
+    self, CompatibleChoiceData, CompatibleChunk, CompatibleFinishReason, CompatibleReasoningDetail,
+    CompatibleStreamProfile, CompatibleToolCallChunk,
 };
 use crate::providers::openai::completion::{
     CompletionModelOptions, GenericCompletionModel, OpenAICompatibleProvider, Usage,
@@ -97,10 +97,24 @@ pub enum FinishReason {
     Other(String), // This will handle the deprecated function_call
 }
 
+impl FinishReason {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::ToolCalls => "tool_calls",
+            Self::Stop => "stop",
+            Self::ContentFilter => "content_filter",
+            Self::Length => "length",
+            Self::Other(reason) => reason,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct StreamingChoice {
     delta: StreamingDelta,
     finish_reason: Option<FinishReason>,
+    #[serde(default)]
+    native_finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -152,6 +166,7 @@ where
             tool_result_array_content: self.tool_result_array_content,
             prompt_caching: self.prompt_caching,
         };
+        let request_body_metadata = self.client.ext().request_body_metadata(&completion_request);
         let mut request = self.client.ext().build_completion_request(
             self.model.clone(),
             completion_request,
@@ -188,6 +203,9 @@ where
         self.client
             .ext()
             .finalize_request_body_with_options(&mut request_as_json, options)?;
+        self.client
+            .ext()
+            .apply_request_body_metadata(&mut request_as_json, request_body_metadata.as_ref())?;
 
         if enabled!(Level::TRACE) {
             tracing::trace!(
@@ -241,7 +259,7 @@ struct OpenAICompatibleProfile<Ext = crate::providers::openai::OpenAICompletions
 
 impl<Ext, U> CompatibleStreamProfile for OpenAICompatibleProfile<Ext, U>
 where
-    Ext: OpenAICompatibleProvider + Clone + crate::wasm_compat::WasmCompatSend,
+    Ext: OpenAICompatibleProvider<StreamingUsage = U> + Clone + crate::wasm_compat::WasmCompatSend,
     U: Clone
         + Default
         + GetTokenUsage
@@ -275,13 +293,18 @@ where
                 |choice| CompatibleChoiceData {
                     // `function_call` is the deprecated pre-tools finish reason
                     // some compatible providers still emit for tool calls.
-                    finish_reason: match &choice.finish_reason {
-                        Some(FinishReason::ToolCalls) => CompatibleFinishReason::ToolCalls,
-                        Some(FinishReason::Other(other)) if other == "function_call" => {
-                            CompatibleFinishReason::ToolCalls
-                        }
-                        _ => CompatibleFinishReason::Other,
-                    },
+                    finish_reason: choice
+                        .finish_reason
+                        .as_ref()
+                        .and_then(|reason| {
+                            super::terminal_metadata_from_finish_reason(Some(reason.as_str()))
+                        })
+                        .map(|metadata| match &choice.native_finish_reason {
+                            Some(native_reason) => metadata.with_raw_reason(native_reason),
+                            None => metadata,
+                        })
+                        .map(CompatibleFinishReason::Terminal)
+                        .unwrap_or(CompatibleFinishReason::Other),
                     text: choice.delta.content.clone(),
                     reasoning: choice
                         .delta
@@ -301,6 +324,14 @@ where
         StreamingCompletionResponse { usage }
     }
 
+    fn normalized_usage(
+        &self,
+        raw_chunk: &serde_json::Value,
+        usage: &Self::Usage,
+    ) -> Option<crate::completion::Usage> {
+        self.provider.normalized_streaming_usage(raw_chunk, usage)
+    }
+
     fn decorate_tool_call(
         &self,
         detail: &Self::Detail,
@@ -308,6 +339,31 @@ where
     ) {
         self.provider
             .decorate_streaming_tool_call(detail, tool_calls);
+    }
+
+    fn reasoning_detail(&self, detail: &Self::Detail) -> Option<CompatibleReasoningDetail> {
+        self.provider
+            .streaming_reasoning_detail(detail)
+            .map(
+                |(id, content, additional_params)| CompatibleReasoningDetail {
+                    id,
+                    content,
+                    additional_params,
+                },
+            )
+    }
+
+    fn legacy_reasoning_is_redundant(
+        &self,
+        legacy_reasoning: &str,
+        details: &[CompatibleReasoningDetail],
+    ) -> bool {
+        let details = details
+            .iter()
+            .map(|detail| detail.content.clone())
+            .collect::<Vec<_>>();
+        self.provider
+            .legacy_streaming_reasoning_is_redundant(legacy_reasoning, &details)
     }
 
     fn uses_distinct_tool_call_eviction(&self) -> bool {
@@ -587,7 +643,7 @@ mod tests {
         // Some providers emit a final "usage-only" chunk where `choices` is empty.
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines([
-                "{\"choices\":[{\"delta\":{\"content\":\"Hello\",\"tool_calls\":[]}}],\"usage\":null}",
+                "{\"choices\":[{\"delta\":{\"content\":\"Hello\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":null}",
                 "{\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}",
                 "[DONE]",
             ]),
@@ -680,7 +736,7 @@ mod tests {
         // Usage chunk includes prompt_tokens_details with cached_tokens.
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines([
-                "{\"choices\":[{\"delta\":{\"content\":\"Hi\",\"tool_calls\":[]}}],\"usage\":null}",
+                "{\"choices\":[{\"delta\":{\"content\":\"Hi\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":null}",
                 "{\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110,\"prompt_tokens_details\":{\"cached_tokens\":80}}}",
                 "[DONE]",
             ]),
@@ -721,6 +777,91 @@ mod tests {
         assert_eq!(core_usage.cached_input_tokens, 80);
         assert_eq!(core_usage.input_tokens, 100);
         assert_eq!(core_usage.total_tokens, 110);
+    }
+
+    #[tokio::test]
+    async fn stream_without_finish_reason_returns_final_response_and_drops_partial_tool_call() {
+        use crate::completion::GetCompletionMetadata;
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                r#"{"choices":[{"delta":{"content":"partial","tool_calls":[{"index":0,"id":"call_123","function":{"name":"lookup","arguments":"{\"id\":"}}]},"finish_reason":null}],"usage":null}"#,
+                "[DONE]",
+            ]),
+        };
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .expect("stream should start");
+        let mut text = String::new();
+        let mut final_response = None;
+        let mut saw_tool_call = false;
+
+        while let Some(chunk) = stream.next().await {
+            match chunk.expect("missing finish_reason should not fail the stream") {
+                streaming::StreamedAssistantContent::Text(content) => {
+                    text.push_str(&content.text);
+                }
+                streaming::StreamedAssistantContent::ToolCall { .. } => saw_tool_call = true,
+                streaming::StreamedAssistantContent::ToolCallDelta { .. } => {}
+                streaming::StreamedAssistantContent::Final(response) => {
+                    final_response = Some(response);
+                }
+                _ => panic!("unexpected stream item"),
+            }
+        }
+
+        assert_eq!(text, "partial");
+        assert!(
+            !saw_tool_call,
+            "incomplete tool call should still be dropped"
+        );
+        final_response.expect("stream should yield a final response");
+        assert!(stream.terminal_metadata().is_none());
+        let _: crate::completion::CompletionResponse<_> = stream.into();
+    }
+
+    #[tokio::test]
+    async fn stream_prefers_native_finish_reason_for_raw_metadata() {
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop","native_finish_reason":"STOP"}],"usage":null}"#,
+                "[DONE]",
+            ]),
+        };
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/chat/completions")
+            .body(Vec::new())
+            .expect("request should build");
+        let mut stream = send_compatible_streaming_request(client, req)
+            .await
+            .expect("stream should start");
+
+        while let Some(chunk) = stream.next().await {
+            chunk.expect("stream item should be valid");
+        }
+
+        use crate::completion::GetCompletionMetadata;
+        let terminal_metadata = stream
+            .terminal_metadata()
+            .expect("finish reason should produce terminal metadata");
+        assert_eq!(
+            terminal_metadata.reason(),
+            crate::completion::CompletionFinishReason::Stop
+        );
+        assert_eq!(terminal_metadata.raw_reason(), Some("STOP"));
+        let _: crate::completion::CompletionResponse<_> = stream.into();
     }
 
     /// Reproduces the bug where a proxy/gateway sends multiple parallel tool
@@ -909,29 +1050,6 @@ mod tests {
                 "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"function\":{\"name\":\"ping\",\"arguments\":\"\"}}]},\"finish_reason\":null}],\"usage\":null}",
                 "{\"choices\":[{\"delta\":{\"tool_calls\":[]},\"finish_reason\":\"tool_calls\"}],\"usage\":null}",
                 "[DONE]",
-            ]),
-        };
-
-        let req = http::Request::builder()
-            .method("POST")
-            .uri("http://localhost/v1/chat/completions")
-            .body(Vec::new())
-            .unwrap();
-
-        let stream = send_compatible_streaming_request(client, req)
-            .await
-            .unwrap();
-
-        assert_zero_arg_tool_call_is_emitted(stream, "call_123", "ping", true).await;
-    }
-
-    #[tokio::test]
-    async fn test_zero_arg_tool_call_is_preserved_at_eof() {
-        use crate::test_utils::MockStreamingClient;
-
-        let client = MockStreamingClient {
-            sse_bytes: sse_bytes_from_data_lines([
-                "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"function\":{\"name\":\"ping\",\"arguments\":\"\"}}]},\"finish_reason\":null}],\"usage\":null}",
             ]),
         };
 

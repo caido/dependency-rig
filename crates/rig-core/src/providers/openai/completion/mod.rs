@@ -4,7 +4,8 @@
 
 use super::{client::ApiResponse, streaming::StreamingCompletionResponse};
 use crate::completion::{
-    CompletionError, CompletionRequest as CoreCompletionRequest, GetTokenUsage,
+    CompletionError, CompletionRequest as CoreCompletionRequest, GetCompletionMetadata,
+    GetTokenUsage,
 };
 use crate::http_client::{self, HttpClientExt};
 use crate::message::{AudioMediaType, DocumentSourceKind, ImageDetail, MimeType};
@@ -1140,6 +1141,14 @@ pub struct CompletionResponse {
     pub usage: Option<Usage>,
 }
 
+impl GetCompletionMetadata for CompletionResponse {
+    fn terminal_metadata(&self) -> Option<completion::CompletionTerminalMetadata> {
+        self.choices.first().and_then(|choice| {
+            terminal_metadata_from_finish_reason(Some(choice.finish_reason.as_str()))
+        })
+    }
+}
+
 impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionResponse> {
     type Error = CompletionError;
 
@@ -1147,6 +1156,8 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
         let choice = response.choices.first().ok_or_else(|| {
             CompletionError::ResponseError("Response contained no choices".to_owned())
         })?;
+        let terminal_metadata =
+            terminal_metadata_from_finish_reason(Some(choice.finish_reason.as_str()));
 
         let content = match &choice.message {
             Message::Assistant {
@@ -1196,11 +1207,24 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             )),
         }?;
 
-        let choice = OneOrMany::many(content).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
+        let allows_empty_choice = terminal_metadata.as_ref().is_some_and(|metadata| {
+            matches!(
+                metadata.reason(),
+                completion::CompletionFinishReason::Length
+                    | completion::CompletionFinishReason::ContentFilter
             )
-        })?;
+        });
+        let choice = match OneOrMany::many(content) {
+            Ok(choice) => choice,
+            Err(_) if allows_empty_choice => {
+                OneOrMany::one(completion::AssistantContent::text(String::new()))
+            }
+            Err(_) => {
+                return Err(CompletionError::ResponseError(
+                    "Response contained no message or tool call (empty)".to_owned(),
+                ));
+            }
+        };
 
         let usage = response
             .usage
@@ -1215,6 +1239,21 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             message_id: None,
         })
     }
+}
+
+pub(crate) fn terminal_metadata_from_finish_reason(
+    raw_reason: Option<&str>,
+) -> Option<completion::CompletionTerminalMetadata> {
+    let raw_reason = raw_reason?;
+    let reason = match raw_reason {
+        "stop" => completion::CompletionFinishReason::Stop,
+        "length" => completion::CompletionFinishReason::Length,
+        "tool_calls" | "function_call" => completion::CompletionFinishReason::ToolCalls,
+        "content_filter" => completion::CompletionFinishReason::ContentFilter,
+        _ => completion::CompletionFinishReason::Unknown,
+    };
+
+    Some(completion::CompletionTerminalMetadata::new(reason).with_raw_reason(raw_reason))
 }
 
 impl ProviderResponseExt for CompletionResponse {
@@ -1515,6 +1554,22 @@ pub trait OpenAICompatibleProvider: crate::client::Provider {
         self.finalize_request_body(body)
     }
 
+    /// Capture provider-private metadata needed after the typed request is serialized.
+    fn request_body_metadata(&self, request: &CoreCompletionRequest) -> Option<serde_json::Value> {
+        let _ = request;
+        None
+    }
+
+    /// Apply provider-private metadata to the serialized request body.
+    fn apply_request_body_metadata(
+        &self,
+        body: &mut serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<(), CompletionError> {
+        let _ = (body, metadata);
+        Ok(())
+    }
+
     /// Decorate streamed tool calls from provider-specific streaming detail
     /// payloads. Most OpenAI-compatible providers do not emit such details.
     fn decorate_streaming_tool_call(
@@ -1523,6 +1578,59 @@ pub trait OpenAICompatibleProvider: crate::client::Provider {
         tool_calls: &mut std::collections::HashMap<usize, crate::streaming::RawStreamingToolCall>,
     ) {
         let _ = (detail, tool_calls);
+    }
+
+    /// Convert a provider-specific streaming detail into a reasoning block.
+    fn streaming_reasoning_detail(
+        &self,
+        detail: &serde_json::Value,
+    ) -> Option<(
+        Option<String>,
+        crate::message::ReasoningContent,
+        Option<serde_json::Value>,
+    )> {
+        let _ = detail;
+        None
+    }
+
+    /// Whether a legacy reasoning string duplicates structured streaming details.
+    fn legacy_streaming_reasoning_is_redundant(
+        &self,
+        legacy_reasoning: &str,
+        details: &[crate::message::ReasoningContent],
+    ) -> bool {
+        let _ = (legacy_reasoning, details);
+        false
+    }
+
+    /// Normalize provider-specific usage fields without changing the public
+    /// raw response type.
+    fn normalized_blocking_usage(
+        &self,
+        raw_response: &serde_json::Value,
+    ) -> Option<completion::Usage> {
+        let _ = raw_response;
+        None
+    }
+
+    /// Extract provider-specific reasoning metadata from the raw blocking response.
+    fn blocking_reasoning_metadata(
+        &self,
+        raw_response: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let _ = raw_response;
+        None
+    }
+
+    /// Normalize provider-specific streaming usage fields without changing
+    /// the public streaming response type.
+    fn normalized_streaming_usage(
+        &self,
+        raw_chunk: &serde_json::Value,
+        usage: &Self::StreamingUsage,
+    ) -> Option<completion::Usage> {
+        let _ = (raw_chunk, usage);
+        None
     }
 }
 
@@ -1967,6 +2075,7 @@ where
             tool_result_array_content: self.tool_result_array_content,
             prompt_caching: self.prompt_caching,
         };
+        let request_body_metadata = self.client.ext().request_body_metadata(&completion_request);
         let mut request = self.client.ext().build_completion_request(
             self.model.to_owned(),
             completion_request,
@@ -1985,6 +2094,9 @@ where
         self.client
             .ext()
             .finalize_request_body_with_options(&mut request_body, options)?;
+        self.client
+            .ext()
+            .apply_request_body_metadata(&mut request_body, request_body_metadata.as_ref())?;
         if enabled!(Level::TRACE) {
             tracing::trace!(
                 target: "rig::completions",
@@ -2011,7 +2123,15 @@ where
             if status.is_success() {
                 let text = http_client::text(response).await?;
 
-                match serde_json::from_str::<ApiResponse<Ext::Response>>(&text)? {
+                let value = serde_json::from_str::<serde_json::Value>(&text)?;
+                if crate::provider_response::has_compatible_error(&value) {
+                    return Err(CompletionError::from_http_response(status, text));
+                }
+                let normalized_usage = self.client.ext().normalized_blocking_usage(&value);
+                let reasoning_metadata =
+                    self.client.ext().blocking_reasoning_metadata(&value);
+
+                match serde_json::from_value::<ApiResponse<Ext::Response>>(value)? {
                     ApiResponse::Ok(response) => {
                         let span = tracing::Span::current();
                         span.record_response_metadata(&response);
@@ -2024,7 +2144,20 @@ where
                             );
                         }
 
-                        response.try_into()
+                        let mut response: completion::CompletionResponse<Ext::Response> =
+                            response.try_into()?;
+                        if let Some(normalized_usage) = normalized_usage {
+                            response.usage = normalized_usage;
+                        }
+                        if let Some(reasoning_metadata) = reasoning_metadata
+                            && let Some(completion::AssistantContent::Reasoning(reasoning)) =
+                                response.choice.iter_mut().find(|content| {
+                                    matches!(content, completion::AssistantContent::Reasoning(_))
+                                })
+                        {
+                            reasoning.additional_params = Some(reasoning_metadata);
+                        }
+                        Ok(response)
                     }
                     ApiResponse::Err(err) => {
                         tracing::warn!(message = %err.message, "provider returned an error response");

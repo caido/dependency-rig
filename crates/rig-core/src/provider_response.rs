@@ -55,6 +55,31 @@ pub(crate) fn completion_error_from_body(
     ))
 }
 
+fn has_populated_error_value(value: &serde_json::Value) -> bool {
+    value.is_object() || value.as_str().is_some_and(|message| !message.is_empty())
+}
+
+/// Returns whether an OpenAI-compatible response carries a provider error.
+///
+/// Some gateways return errors inside a nominally successful response and may
+/// retain a `choices` array in the same payload. Inspect both top-level and
+/// choice-level error fields, plus the standardized error finish reason.
+pub(crate) fn has_compatible_error(value: &serde_json::Value) -> bool {
+    value.get("error").is_some_and(has_populated_error_value)
+        || value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice.get("error").is_some_and(has_populated_error_value)
+                        || choice
+                            .get("finish_reason")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|reason| reason == "error")
+                })
+            })
+}
+
 /// Implements the `provider_response_*` inspection helpers on a capability error
 /// enum.
 ///

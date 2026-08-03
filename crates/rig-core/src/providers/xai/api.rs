@@ -189,7 +189,7 @@ impl TryFrom<RigMessage> for Vec<Message> {
         fn reasoning_item(
             reasoning: crate::message::Reasoning,
         ) -> Result<Message, CompletionError> {
-            let crate::message::Reasoning { id, content } = reasoning;
+            let crate::message::Reasoning { id, content, .. } = reasoning;
             let id = id.ok_or_else(|| {
                 CompletionError::RequestError(
                     "Assistant reasoning `id` is required for xAI Responses replay".into(),
@@ -198,6 +198,9 @@ impl TryFrom<RigMessage> for Vec<Message> {
             let mut encrypted_content = None;
             let mut summary = Vec::new();
             for reasoning_content in content {
+                let Some(reasoning_content) = reasoning_content.into_provider_content() else {
+                    continue;
+                };
                 match reasoning_content {
                     ReasoningContent::Text { text, .. } | ReasoningContent::Summary(text) => {
                         summary.push(ReasoningSummary::SummaryText { text });
@@ -213,6 +216,7 @@ impl TryFrom<RigMessage> for Vec<Message> {
                         }
                         encrypted_content.get_or_insert(data);
                     }
+                    ReasoningContent::ProviderData { .. } => continue,
                 }
             }
 
@@ -444,6 +448,7 @@ mod tests {
     fn assistant_redacted_reasoning_is_serialized_as_encrypted_content() {
         let reasoning = Reasoning {
             id: Some("rs_1".to_string()),
+            additional_params: None,
             content: vec![ReasoningContent::Redacted {
                 data: "opaque-redacted".to_string(),
             }],
@@ -469,6 +474,7 @@ mod tests {
     fn assistant_redacted_reasoning_does_not_leak_into_summary_text() {
         let reasoning = Reasoning {
             id: Some("rs_2".to_string()),
+            additional_params: None,
             content: vec![
                 ReasoningContent::Text {
                     text: "explain".to_string(),
@@ -507,6 +513,7 @@ mod tests {
     fn assistant_empty_reasoning_content_roundtrips_without_error() {
         let reasoning = Reasoning {
             id: Some("rs_empty".to_string()),
+            additional_params: None,
             content: vec![],
         };
         let message = RigMessage::Assistant {

@@ -13,38 +13,52 @@ use futures::StreamExt;
 use http::Request;
 use tracing_futures::Instrument;
 
-use crate::completion::{CompletionError, GetTokenUsage};
+use crate::completion::{CompletionError, CompletionTerminalMetadata, GetTokenUsage};
 use crate::http_client::HttpClientExt;
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::json_utils;
-use crate::streaming::{self, RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
+use crate::message::ReasoningContent;
+use crate::streaming::{
+    self, InternalStreamingChoice, RawStreamingChoice, RawStreamingToolCall, StreamingFinalSidecar,
+    ToolCallDeltaContent,
+};
 use crate::wasm_compat::WasmCompatSend;
 
 fn provider_response_from_compatible_sse_data(data: &str) -> Option<CompletionError> {
     let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
-    // Treat the chunk as an error only when `error` is present AND carries a
-    // payload: either an object (`{"error":{...}}`, the canonical OpenAI-compatible
-    // error event) or a non-empty string (`{"error":"oops"}`, used by some
-    // gateways). A `{"error":null}` or `{"error":""}` chunk — which some providers
-    // send alongside the terminal usage event — must not terminate the stream.
-    let error = value
-        .get("error")
-        .filter(|error| error.is_object() || error.as_str().is_some_and(|s| !s.is_empty()))?;
-    if value.get("choices").is_some() {
-        return None;
-    }
+    // A populated error can appear at the top level or inside a choice, even
+    // alongside partial content. Null and empty-string error placeholders are
+    // ignored unless the choice explicitly terminates with `finish_reason:error`.
+    crate::provider_response::has_compatible_error(&value).then_some(())?;
 
-    if let Some(message) = error.get("message").and_then(serde_json::Value::as_str) {
-        tracing::warn!(message, "provider returned a streaming error event");
-    }
+    tracing::warn!("provider returned a streaming error event");
 
     Some(crate::provider_response::completion_error_from_body(data))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompatibleFinishReason {
-    ToolCalls,
     Other,
+    ToolCalls,
+    Terminal(CompletionTerminalMetadata),
+}
+
+impl CompatibleFinishReason {
+    fn is_tool_calls(&self) -> bool {
+        matches!(self, Self::ToolCalls)
+            || matches!(
+                self,
+                Self::Terminal(metadata)
+                if metadata.reason() == crate::completion::CompletionFinishReason::ToolCalls
+            )
+    }
+
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        match self {
+            Self::Terminal(metadata) => Some(metadata.clone()),
+            Self::Other | Self::ToolCalls => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +120,13 @@ pub(crate) struct CompatibleChunk<U, D> {
     pub(crate) usage: Option<U>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CompatibleReasoningDetail {
+    pub(crate) id: Option<String>,
+    pub(crate) content: ReasoningContent,
+    pub(crate) additional_params: Option<serde_json::Value>,
+}
+
 pub(crate) type NormalizedCompatibleChunk<U, D> =
     Result<Option<CompatibleChunk<U, D>>, CompletionError>;
 
@@ -164,6 +185,14 @@ pub(crate) trait CompatibleStreamProfile: WasmCompatSend {
 
     fn build_final_response(&self, usage: Self::Usage) -> Self::FinalResponse;
 
+    fn normalized_usage(
+        &self,
+        _raw_chunk: &serde_json::Value,
+        _usage: &Self::Usage,
+    ) -> Option<crate::completion::Usage> {
+        None
+    }
+
     fn uses_distinct_tool_call_eviction(&self) -> bool {
         false
     }
@@ -182,6 +211,18 @@ pub(crate) trait CompatibleStreamProfile: WasmCompatSend {
         _detail: &Self::Detail,
         _tool_calls: &mut HashMap<usize, RawStreamingToolCall>,
     ) {
+    }
+
+    fn reasoning_detail(&self, _detail: &Self::Detail) -> Option<CompatibleReasoningDetail> {
+        None
+    }
+
+    fn legacy_reasoning_is_redundant(
+        &self,
+        _legacy_reasoning: &str,
+        _details: &[CompatibleReasoningDetail],
+    ) -> bool {
+        false
     }
 
     fn emits_complete_single_chunk_tool_calls(&self) -> bool {
@@ -231,6 +272,8 @@ where
     let stream = stream! {
         let mut tool_calls: HashMap<usize, RawStreamingToolCall> = HashMap::new();
         let mut final_usage = None;
+        let mut final_normalized_usage = None;
+        let mut terminal_metadata = None;
         let mut terminated_with_error = false;
 
         while let Some(event_result) = event_source.next().await {
@@ -250,6 +293,7 @@ where
                         break;
                     }
 
+                    let raw_chunk = serde_json::from_str::<serde_json::Value>(&message.data).ok();
                     let chunk = match profile.normalize_chunk(&message.data) {
                         Ok(Some(chunk)) => chunk,
                         Ok(None) => continue,
@@ -267,6 +311,9 @@ where
                     );
 
                     if let Some(usage) = chunk.usage {
+                        final_normalized_usage = raw_chunk
+                            .as_ref()
+                            .and_then(|raw_chunk| profile.normalized_usage(raw_chunk, &usage));
                         final_usage = Some(usage);
                     }
 
@@ -274,14 +321,18 @@ where
                         continue;
                     };
 
+                    if let Some(metadata) = choice.finish_reason.terminal_metadata() {
+                        terminal_metadata = Some(metadata);
+                    }
+
                     for incoming in choice.tool_calls {
                         if let Some(existing) = tool_calls.get(&incoming.index)
                             && profile.should_evict(existing, &incoming)
                             && let Some(evicted) = tool_calls.remove(&incoming.index)
                         {
-                            yield Ok(RawStreamingChoice::ToolCall(
+                            yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::ToolCall(
                                 finalize_completed_streaming_tool_call(evicted),
-                            ));
+                            )));
                         }
 
                         let existing_tool_call = tool_calls
@@ -298,22 +349,22 @@ where
                             && !name.is_empty()
                         {
                             existing_tool_call.name = name.clone();
-                            yield Ok(RawStreamingChoice::ToolCallDelta {
+                            yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::ToolCallDelta {
                                 id: existing_tool_call.id.clone(),
                                 internal_call_id: existing_tool_call.internal_call_id.clone(),
                                 content: ToolCallDeltaContent::Name(name.clone()),
-                            });
+                            }));
                         }
 
                         if let Some(arguments) = incoming.arguments.as_ref()
                             && !arguments.is_empty()
                         {
                             append_tool_call_arguments(existing_tool_call, arguments);
-                            yield Ok(RawStreamingChoice::ToolCallDelta {
+                            yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::ToolCallDelta {
                                 id: existing_tool_call.id.clone(),
                                 internal_call_id: existing_tool_call.internal_call_id.clone(),
                                 content: ToolCallDeltaContent::Delta(arguments.clone()),
-                            });
+                            }));
                         }
 
                         let emit_completed_tool_call_immediately = profile
@@ -328,35 +379,56 @@ where
 
                         if let Some(tool_call) = finalized_tool_call {
                             tool_calls.remove(&incoming.index);
-                            yield Ok(RawStreamingChoice::ToolCall(tool_call));
+                            yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::ToolCall(tool_call)));
                         }
                     }
 
+                    let mut reasoning_details = Vec::new();
                     for detail in &choice.details {
                         profile.decorate_tool_call(detail, &mut tool_calls);
+                        if let Some(reasoning) = profile.reasoning_detail(detail) {
+                            reasoning_details.push(reasoning);
+                        }
+                    }
+
+                    for detail in &reasoning_details {
+                        yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::Reasoning {
+                            id: detail.id.clone(),
+                            content: ReasoningContent::ProviderData {
+                                content: Some(Box::new(detail.content.clone())),
+                                additional_params: detail
+                                    .additional_params
+                                    .clone()
+                                    .unwrap_or(serde_json::Value::Null),
+                            },
+                        }));
                     }
 
                     if let Some(reasoning) = choice.reasoning
                         && !reasoning.is_empty()
+                        && !profile.legacy_reasoning_is_redundant(
+                            &reasoning,
+                            &reasoning_details,
+                        )
                     {
-                        yield Ok(RawStreamingChoice::ReasoningDelta {
+                        yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::ReasoningDelta {
                             id: None,
                             reasoning,
-                        });
+                        }));
                     }
 
                     if let Some(content) = choice.text
                         && !content.is_empty()
                     {
-                        yield Ok(RawStreamingChoice::Message(content));
+                        yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::Message(content)));
                     }
 
-                    if choice.finish_reason == CompatibleFinishReason::ToolCalls {
+                    if choice.finish_reason.is_tool_calls() {
                         for tool_call in take_finalized_tool_calls(
                             &mut tool_calls,
                             DroppedToolCallContext::ToolCallsFinishReason,
                         ) {
-                            yield Ok(RawStreamingChoice::ToolCall(tool_call));
+                            yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::ToolCall(tool_call)));
                         }
                     }
                 }
@@ -381,20 +453,24 @@ where
         for tool_call in
             take_finalized_tool_calls(&mut tool_calls, DroppedToolCallContext::EndOfStream)
         {
-            yield Ok(RawStreamingChoice::ToolCall(tool_call));
+            yield Ok(InternalStreamingChoice::Raw(RawStreamingChoice::ToolCall(tool_call)));
         }
 
         let final_usage = final_usage.unwrap_or_default();
         record_usage(&span, &final_usage);
-        yield Ok(RawStreamingChoice::FinalResponse(
-            profile.build_final_response(final_usage),
-        ));
+        yield Ok(InternalStreamingChoice::Final {
+            response: profile.build_final_response(final_usage),
+            sidecar: StreamingFinalSidecar {
+                terminal_metadata,
+                normalized_usage: final_normalized_usage,
+            },
+        });
     }
     .instrument(instrument_span);
 
-    Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
-        stream,
-    )))
+    Ok(streaming::StreamingCompletionResponse::stream_internal(
+        Box::pin(stream),
+    ))
 }
 
 fn record_usage<T>(span: &tracing::Span, usage: &T)
@@ -673,11 +749,13 @@ mod tests {
         assert!(detect(r#"{"error":""}"#).is_none());
         // A normal content chunk (no `error` key) is also not an error.
         assert!(detect(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).is_none());
-        // A live content chunk that ALSO carries an `error` field must NOT terminate
-        // the stream — the `choices` guard wins regardless of the error value.
-        assert!(detect(r#"{"error":"metadata","choices":[{"delta":{"content":"hi"}}]}"#).is_none());
+        // A populated error remains an error even when a gateway also includes choices.
         assert!(
-            detect(r#"{"error":{"message":"x"},"choices":[{"delta":{"content":"hi"}}]}"#).is_none()
+            detect(r#"{"error":"failed","choices":[{"delta":{"content":"partial"}}]}"#).is_some()
+        );
+        assert!(
+            detect(r#"{"choices":[{"delta":{},"finish_reason":"error","error":{"message":"x"}}]}"#)
+                .is_some()
         );
 
         // A non-empty string `error` IS detected, preserving the raw body.
@@ -1055,7 +1133,7 @@ mod tests {
         use crate::providers::openai::send_compatible_streaming_request;
         use crate::test_utils::MockStreamingClient;
 
-        let body = r#"{"error":{"message":"upstream unavailable","type":"server_error"}}"#;
+        let body = r#"{"choices":[{"delta":{},"finish_reason":"error","error":{"message":"upstream unavailable"}}],"error":{"message":"upstream unavailable","type":"server_error"}}"#;
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines([
                 "{\"choices\":[{\"delta\":{\"content\":\"partial\",\"tool_calls\":[]}}],\"usage\":null}",

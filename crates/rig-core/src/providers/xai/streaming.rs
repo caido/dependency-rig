@@ -108,6 +108,7 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Summary(text),
+                ..
             }) if id == "xr_1" && text == "s1"
         ));
         assert!(matches!(
@@ -115,6 +116,7 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Summary(text),
+                ..
             }) if id == "xr_1" && text == "s2"
         ));
         assert!(matches!(
@@ -122,6 +124,7 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Encrypted(data),
+                ..
             }) if id == "xr_1" && data == "enc"
         ));
     }

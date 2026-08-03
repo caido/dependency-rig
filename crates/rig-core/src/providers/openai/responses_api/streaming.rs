@@ -175,11 +175,12 @@ pub(crate) fn parse_sse_completion_body(
             if let StreamingCompletionChunk::Response(chunk) = chunk {
                 let ResponseChunk { kind, response, .. } = *chunk;
                 match kind {
-                    ResponseChunkKind::ResponseCompleted => {
+                    ResponseChunkKind::ResponseCompleted
+                    | ResponseChunkKind::ResponseIncomplete => {
                         completed = Some(response);
                         break;
                     }
-                    ResponseChunkKind::ResponseFailed | ResponseChunkKind::ResponseIncomplete => {
+                    ResponseChunkKind::ResponseFailed => {
                         return Err(crate::provider_response::completion_error_from_body(data));
                     }
                     _ => {}
@@ -194,13 +195,13 @@ pub(crate) fn parse_sse_completion_body(
         };
 
         match value.get("type").and_then(serde_json::Value::as_str) {
-            Some("response.completed") => {
+            Some("response.completed") | Some("response.incomplete") => {
                 if let Some(response) = value.get("response") {
                     completed = Some(serde_json::from_value(response.clone())?);
                     break;
                 }
             }
-            Some("response.failed") | Some("response.incomplete") => {
+            Some("response.failed") => {
                 return Err(crate::provider_response::completion_error_from_body(data));
             }
             Some("error") => {
@@ -211,8 +212,8 @@ pub(crate) fn parse_sse_completion_body(
     }
 
     completed.ok_or_else(|| {
-        CompletionError::ProviderError(format!(
-            "{provider_name} stream did not yield response.completed"
+        CompletionError::ResponseError(format!(
+            "{provider_name} stream did not yield a terminal response"
         ))
     })
 }
@@ -221,6 +222,8 @@ struct RawChoiceAccumulator {
     final_usage: ResponsesUsage,
     reasoning_metadata: Option<serde_json::Map<String, serde_json::Value>>,
     reasoning_context: Option<String>,
+    terminal_metadata: Option<completion::CompletionTerminalMetadata>,
+    terminal_response_seen: bool,
     tool_calls: Vec<StreamingRawChoice>,
     tool_call_internal_ids: std::collections::HashMap<String, String>,
 }
@@ -231,6 +234,8 @@ impl RawChoiceAccumulator {
             final_usage: initial_usage,
             reasoning_metadata: None,
             reasoning_context: None,
+            terminal_metadata: None,
+            terminal_response_seen: false,
             tool_calls: Vec::new(),
             tool_call_internal_ids: std::collections::HashMap::new(),
         }
@@ -317,7 +322,9 @@ impl RawChoiceAccumulator {
         raw_event_data: &str,
     ) -> Result<(), CompletionError> {
         match kind {
-            ResponseChunkKind::ResponseCompleted => {
+            ResponseChunkKind::ResponseCompleted | ResponseChunkKind::ResponseIncomplete => {
+                self.terminal_response_seen = true;
+                self.terminal_metadata = super::terminal_metadata_from_response(&response);
                 if let Some(usage) = response.usage {
                     self.final_usage = usage;
                 }
@@ -329,7 +336,7 @@ impl RawChoiceAccumulator {
                 }
                 Ok(())
             }
-            ResponseChunkKind::ResponseFailed | ResponseChunkKind::ResponseIncomplete => Err(
+            ResponseChunkKind::ResponseFailed => Err(
                 crate::provider_response::completion_error_from_body(raw_event_data),
             ),
             _ => Ok(()),
@@ -388,17 +395,34 @@ impl RawChoiceAccumulator {
         }
     }
 
-    fn finish(mut self) -> Vec<StreamingRawChoice> {
+    fn finish(
+        mut self,
+    ) -> (
+        Vec<StreamingRawChoice>,
+        StreamingCompletionResponse,
+        Option<completion::CompletionTerminalMetadata>,
+    ) {
         let mut choices = Vec::new();
         choices.append(&mut self.tool_calls);
-        choices.push(RawStreamingChoice::FinalResponse(
+        (
+            choices,
             StreamingCompletionResponse {
                 usage: self.final_usage,
                 reasoning_metadata: self.reasoning_metadata,
                 reasoning_context: self.reasoning_context,
             },
-        ));
-        choices
+            self.terminal_metadata,
+        )
+    }
+
+    fn ensure_terminal_response(&self) -> Result<(), CompletionError> {
+        if self.terminal_response_seen {
+            Ok(())
+        } else {
+            Err(CompletionError::ResponseError(
+                "OpenAI Responses stream ended without a terminal response".to_owned(),
+            ))
+        }
     }
 }
 
@@ -528,7 +552,10 @@ pub(crate) fn raw_choices_from_sse_body(
         }
     }
 
-    raw_choices.extend(accumulator.finish());
+    accumulator.ensure_terminal_response()?;
+    let (mut final_choices, final_response, _) = accumulator.finish();
+    raw_choices.append(&mut final_choices);
+    raw_choices.push(RawStreamingChoice::FinalResponse(final_response));
     Ok(raw_choices)
 }
 
@@ -633,8 +660,16 @@ where
                     continue;
                 }
                 Ok(Event::Message(evt)) => {
-                    if evt.data.trim().is_empty() || evt.data == "[DONE]" {
+                    if evt.data.trim().is_empty() {
                         continue;
+                    }
+
+                    if evt.data == "[DONE]" {
+                        if let Err(error) = accumulator.ensure_terminal_response() {
+                            terminated_with_error = true;
+                            yield Err(error);
+                        }
+                        break;
                     }
 
                     if let Some(error) = provider_response_from_responses_sse_data(&evt.data) {
@@ -659,7 +694,7 @@ where
                     match data {
                         StreamingCompletionChunk::Delta(chunk) => {
                             for choice in accumulator.decode_item_chunk(chunk, options) {
-                                yield Ok(choice);
+                                yield Ok(streaming::InternalStreamingChoice::Raw(choice));
                             }
                         }
                         StreamingCompletionChunk::Response(chunk) => {
@@ -698,11 +733,25 @@ where
             return;
         }
 
-        let final_usage = accumulator.final_usage.clone();
-
-        for tool_call in accumulator.finish() {
-            yield Ok(tool_call)
+        if let Err(error) = accumulator.ensure_terminal_response() {
+            yield Err(error);
+            return;
         }
+
+        let final_usage = accumulator.final_usage.clone();
+        let (tool_calls, final_response, terminal_metadata) = accumulator.finish();
+
+        for tool_call in tool_calls {
+            yield Ok(streaming::InternalStreamingChoice::Raw(tool_call))
+        }
+
+        yield Ok(streaming::InternalStreamingChoice::Final {
+            response: final_response,
+            sidecar: streaming::StreamingFinalSidecar {
+                terminal_metadata,
+                normalized_usage: None,
+            },
+        });
 
         span.record("gen_ai.usage.input_tokens", final_usage.input_tokens);
         span.record("gen_ai.usage.output_tokens", final_usage.output_tokens);
@@ -716,7 +765,7 @@ where
     }
     .instrument(span);
 
-    streaming::StreamingCompletionResponse::stream(Box::pin(stream))
+    streaming::StreamingCompletionResponse::stream_internal(Box::pin(stream))
 }
 
 /// An item message chunk from OpenAI's Responses API.
@@ -902,7 +951,7 @@ mod tests {
         ItemChunkKind, StreamingCompletionChunk, raw_choices_from_sse_body,
         reasoning_choices_from_done_item,
     };
-    use crate::completion::CompletionModel;
+    use crate::completion::{CompletionModel, CompletionTerminalMetadata, GetCompletionMetadata};
     use crate::message::ReasoningContent;
     use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
     use crate::providers::openai::responses_api::{
@@ -959,7 +1008,10 @@ mod tests {
 
     async fn final_response_from_event(
         event: serde_json::Value,
-    ) -> super::StreamingCompletionResponse {
+    ) -> (
+        super::StreamingCompletionResponse,
+        Option<CompletionTerminalMetadata>,
+    ) {
         let client = openai::Client::builder()
             .http_client(MockStreamingClient {
                 sse_bytes: sse_bytes_from_json_events(&[event]),
@@ -973,7 +1025,9 @@ mod tests {
 
         while let Some(item) = stream.next().await {
             match item.expect("completed stream should not error") {
-                StreamedAssistantContent::Final(response) => return response,
+                StreamedAssistantContent::Final(response) => {
+                    return (response, stream.terminal_metadata());
+                }
                 _ => continue,
             }
         }
@@ -1039,6 +1093,7 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Summary(text),
+                ..
             }) if id == "rs_1" && text == "step 1"
         ));
         assert!(matches!(
@@ -1046,6 +1101,7 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Summary(text),
+                ..
             }) if id == "rs_1" && text == "step 2"
         ));
         assert!(matches!(
@@ -1053,6 +1109,7 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Text { text, signature: None },
+                ..
             }) if id == "rs_1" && text == "private reasoning"
         ));
         assert!(matches!(
@@ -1060,14 +1117,16 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Encrypted(data),
+                ..
             }) if id == "rs_1" && data == "enc_blob"
         ));
     }
 
     #[test]
     fn reasoning_output_item_done_emits_reasoning_text_content() {
+        let completed = sample_response(ResponseStatus::Completed);
         let body = format!(
-            "data: {}\n",
+            "data: {}\ndata: {}\n",
             json!({
                 "type": "response.output_item.done",
                 "output_index": 0,
@@ -1079,7 +1138,12 @@ mod tests {
                     "content": [{ "type": "reasoning_text", "text": "visible reasoning" }],
                     "status": "completed"
                 },
-            })
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 2,
+                "response": completed,
+            }),
         );
 
         let choices = raw_choices_from_sse_body(&body, ResponsesUsage::new())
@@ -1090,14 +1154,16 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Text { text, signature: None },
+                ..
             }) if id == "rs_text_1" && text == "visible reasoning"
         ));
     }
 
     #[test]
     fn reasoning_text_delta_emits_reasoning_delta() {
+        let completed = sample_response(ResponseStatus::Completed);
         let body = format!(
-            "data: {}\n",
+            "data: {}\ndata: {}\n",
             json!({
                 "type": "response.reasoning_text.delta",
                 "item_id": "rs_delta_1",
@@ -1105,7 +1171,12 @@ mod tests {
                 "content_index": 0,
                 "sequence_number": 1,
                 "delta": "thinking",
-            })
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 2,
+                "response": completed,
+            }),
         );
 
         let choices = raw_choices_from_sse_body(&body, ResponsesUsage::new())
@@ -1130,14 +1201,23 @@ mod tests {
             "status": "completed",
             "action": { "type": "search", "queries": ["rig framework"] },
         });
+        let mut completed = sample_response(ResponseStatus::Completed);
+        completed
+            .output
+            .push(serde_json::from_value(item.clone()).expect("unknown output should deserialize"));
         let body = format!(
-            "data: {}\n",
+            "data: {}\ndata: {}\n",
             json!({
                 "type": "response.output_item.done",
                 "output_index": 0,
                 "sequence_number": 1,
                 "item": item,
-            })
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 2,
+                "response": completed,
+            }),
         );
 
         let choices = raw_choices_from_sse_body(&body, ResponsesUsage::new())
@@ -1167,6 +1247,7 @@ mod tests {
             Some(RawStreamingChoice::Reasoning {
                 id: Some(id),
                 content: ReasoningContent::Summary(text),
+                ..
             }) if id == "rs_2" && text == "only summary"
         ));
     }
@@ -1342,10 +1423,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_incomplete_chunk_uses_incomplete_details_reason() {
+    async fn response_incomplete_chunk_preserves_usage_and_exposes_length_finish_reason() {
         let mut response = sample_response(ResponseStatus::Incomplete);
         response.incomplete_details = Some(IncompleteDetailsReason {
             reason: "max_output_tokens".to_string(),
+        });
+        response.usage = Some(ResponsesUsage {
+            input_tokens: 12,
+            input_tokens_details: None,
+            output_tokens: 16,
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: 4,
+            }),
+            total_tokens: 28,
         });
 
         let event = json!({
@@ -1354,16 +1444,26 @@ mod tests {
             "response": response,
         });
 
-        let err = first_error_from_event(event).await;
+        let (response, terminal_metadata) = final_response_from_event(event).await;
+        let metadata = terminal_metadata
+            .as_ref()
+            .expect("incomplete response should retain terminal metadata");
 
-        assert!(matches!(
-            err,
-            crate::completion::CompletionError::ProviderResponse(_)
-        ));
-        assert_eq!(err.provider_response_status(), None);
-        assert!(err.provider_response_body().is_some_and(|body| {
-            body.contains("response.incomplete") && body.contains("max_output_tokens")
-        }));
+        assert_eq!(
+            metadata.reason(),
+            crate::completion::CompletionFinishReason::Length
+        );
+        assert_eq!(metadata.raw_reason(), Some("max_output_tokens"));
+        assert_eq!(response.usage.input_tokens, 12);
+        assert_eq!(response.usage.output_tokens, 16);
+        assert_eq!(
+            response
+                .usage
+                .output_tokens_details
+                .unwrap()
+                .reasoning_tokens,
+            4
+        );
     }
 
     #[tokio::test]
@@ -1573,7 +1673,7 @@ mod tests {
             "response": response,
         });
 
-        let usage = final_response_from_event(event).await.usage;
+        let usage = final_response_from_event(event).await.0.usage;
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
@@ -1595,7 +1695,7 @@ mod tests {
         });
         event["response"]["reasoning"] = metadata.clone();
 
-        let response = final_response_from_event(event).await;
+        let response = final_response_from_event(event).await.0;
         assert_eq!(response.reasoning_context.as_deref(), Some("all_turns"));
         assert_eq!(response.reasoning_metadata.as_ref(), metadata.as_object());
     }

@@ -15,7 +15,7 @@
 //! ```
 use super::InputAudio;
 use super::responses_api::streaming::StreamingCompletionResponse;
-use crate::completion::{CompletionError, GetTokenUsage};
+use crate::completion::{CompletionError, GetCompletionMetadata, GetTokenUsage};
 use crate::http_client;
 use crate::http_client::HttpClientExt;
 use crate::json_utils;
@@ -680,6 +680,9 @@ fn openai_reasoning_from_core(
     let mut reasoning_content = Vec::new();
     let mut encrypted_content = None;
     for content in &reasoning.content {
+        let Some(content) = content.provider_content() else {
+            continue;
+        };
         match content {
             crate::message::ReasoningContent::Text { text, .. } => {
                 reasoning_content.push(text.clone());
@@ -693,6 +696,7 @@ fn openai_reasoning_from_core(
             | crate::message::ReasoningContent::Redacted { data } => {
                 encrypted_content.get_or_insert_with(|| data.clone());
             }
+            crate::message::ReasoningContent::ProviderData { .. } => continue,
         }
     }
 
@@ -2137,6 +2141,7 @@ impl From<Output> for Vec<completion::AssistantContent> {
                     message::Reasoning {
                         id: Some(id),
                         content,
+                        additional_params: None,
                     },
                 )]
             }
@@ -2265,8 +2270,12 @@ where
             let response = self.client.send(req).await?;
 
             if response.status().is_success() {
+                let status = response.status();
                 let t = http_client::text(response).await?;
                 let response = serde_json::from_str::<Self::Response>(&t)?;
+                if response.status == ResponseStatus::Failed {
+                    return Err(CompletionError::from_http_response(status, t));
+                }
                 let span = tracing::Span::current();
                 span.record("gen_ai.response.id", &response.id);
                 span.record("gen_ai.response.model", &response.model);
@@ -2313,6 +2322,8 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     type Error = CompletionError;
 
     fn try_from(response: CompletionResponse) -> Result<Self, Self::Error> {
+        ensure_terminal_success(&response)?;
+        let is_incomplete = response.status == ResponseStatus::Incomplete;
         // Extract the msg_ ID from the first Output::Message item
         let message_id = response.output.iter().find_map(|item| match item {
             Output::Message(msg) => Some(msg.id.clone()),
@@ -2343,11 +2354,17 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             })
             .unwrap_or(output_content);
 
-        let choice = OneOrMany::many(content).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
-            )
-        })?;
+        let choice = match OneOrMany::many(content) {
+            Ok(choice) => choice,
+            Err(_) if is_incomplete => {
+                OneOrMany::one(completion::AssistantContent::text(String::new()))
+            }
+            Err(_) => {
+                return Err(CompletionError::ResponseError(
+                    "Response contained no message or tool call (empty)".to_owned(),
+                ));
+            }
+        };
 
         let usage = response
             .usage
@@ -2362,6 +2379,81 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             message_id,
         })
     }
+}
+
+impl GetCompletionMetadata for CompletionResponse {
+    fn terminal_metadata(&self) -> Option<completion::CompletionTerminalMetadata> {
+        terminal_metadata_from_response(self)
+    }
+}
+
+fn ensure_terminal_success(response: &CompletionResponse) -> Result<(), CompletionError> {
+    match response.status {
+        ResponseStatus::Completed | ResponseStatus::Incomplete => Ok(()),
+        ResponseStatus::Failed => Err(CompletionError::from_provider_body(
+            serde_json::to_string(response).unwrap_or_else(|_| {
+                response
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| {
+                        "OpenAI Responses API returned a failed response".to_string()
+                    })
+            }),
+        )),
+        ResponseStatus::Cancelled | ResponseStatus::InProgress | ResponseStatus::Queued => {
+            Err(CompletionError::ProviderError(format!(
+                "OpenAI Responses API ended in state {:?}",
+                response.status
+            )))
+        }
+    }
+}
+
+pub(crate) fn terminal_metadata_from_response(
+    response: &CompletionResponse,
+) -> Option<completion::CompletionTerminalMetadata> {
+    match response.status {
+        ResponseStatus::Completed => {
+            let reason = if response
+                .output
+                .iter()
+                .any(|output| matches!(output, Output::FunctionCall(_)))
+            {
+                completion::CompletionFinishReason::ToolCalls
+            } else {
+                completion::CompletionFinishReason::Stop
+            };
+            Some(completion::CompletionTerminalMetadata::new(reason).with_raw_reason("completed"))
+        }
+        ResponseStatus::Incomplete => Some(
+            response
+                .incomplete_details
+                .as_ref()
+                .map(|details| terminal_metadata_from_incomplete_reason(&details.reason))
+                .unwrap_or_else(|| {
+                    completion::CompletionTerminalMetadata::new(
+                        completion::CompletionFinishReason::Unknown,
+                    )
+                }),
+        ),
+        ResponseStatus::Failed
+        | ResponseStatus::Cancelled
+        | ResponseStatus::InProgress
+        | ResponseStatus::Queued => None,
+    }
+}
+
+fn terminal_metadata_from_incomplete_reason(
+    raw_reason: &str,
+) -> completion::CompletionTerminalMetadata {
+    let reason = match raw_reason {
+        "max_output_tokens" => completion::CompletionFinishReason::Length,
+        "content_filter" => completion::CompletionFinishReason::ContentFilter,
+        _ => completion::CompletionFinishReason::Unknown,
+    };
+
+    completion::CompletionTerminalMetadata::new(reason).with_raw_reason(raw_reason)
 }
 
 /// An OpenAI Responses API message.
@@ -3918,6 +4010,36 @@ mod tests {
     }
 
     #[test]
+    fn completion_response_try_from_rejects_failed_status_without_http_context() {
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "resp_failed",
+            "object": "response",
+            "created_at": 1,
+            "status": "failed",
+            "error": {
+                "code": "server_error",
+                "message": "tool execution failed"
+            },
+            "model": "gpt-4o-mini",
+            "output": [],
+            "tools": []
+        }))
+        .expect("failed response should deserialize");
+
+        let error = completion::CompletionResponse::<CompletionResponse>::try_from(response)
+            .expect_err("failed response status should be rejected");
+
+        assert!(matches!(error, CompletionError::ProviderResponse(_)));
+        assert_eq!(error.provider_response_status(), None);
+        let json = error
+            .provider_response_json()
+            .expect("fallback body should be valid JSON")
+            .expect("parsed JSON should be present");
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["error"]["code"], "server_error");
+    }
+
+    #[test]
     fn completion_response_preserves_context_without_treating_config_as_text() {
         let response: CompletionResponse = serde_json::from_value(json!({
             "id": "resp_123",
@@ -4341,6 +4463,7 @@ mod tests {
             id: Some("msg_123".to_string()),
             content: OneOrMany::one(message::AssistantContent::Reasoning(message::Reasoning {
                 id: Some("rs_123".to_string()),
+                additional_params: None,
                 content: vec![message::ReasoningContent::Summary(
                     "structured summary".to_string(),
                 )],
@@ -4366,6 +4489,7 @@ mod tests {
             id: Some("msg_123".to_string()),
             content: OneOrMany::one(message::AssistantContent::Reasoning(message::Reasoning {
                 id: Some("rs_123".to_string()),
+                additional_params: None,
                 content: vec![message::ReasoningContent::Summary(
                     "structured summary".to_string(),
                 )],
@@ -4390,6 +4514,7 @@ mod tests {
             content: OneOrMany::many(vec![
                 message::AssistantContent::Reasoning(message::Reasoning {
                     id: Some("rs_123".to_string()),
+                    additional_params: None,
                     content: vec![message::ReasoningContent::Summary(
                         "structured summary".to_string(),
                     )],
@@ -4622,6 +4747,58 @@ mod tests {
             .expect("raw body should be valid JSON")
             .expect("parsed JSON should be present");
         assert_eq!(json["error"]["code"], "invalid_value");
+    }
+
+    #[tokio::test]
+    async fn responses_completion_failed_status_preserves_http_response_verbatim() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel;
+        use crate::providers::openai::Client;
+        use crate::test_utils::RecordingHttpClient;
+
+        let body = r#"{
+  "id": "resp_failed",
+  "object": "response",
+  "created_at": 1,
+  "status": "failed",
+  "error": {
+    "code": "server_error",
+    "message": "tool execution failed"
+  },
+  "model": "gpt-4o-mini",
+  "output": [],
+  "tools": [],
+  "future_error_context": {
+    "request_phase": "tool_execution",
+    "retryable": false
+  }
+}"#;
+        let http_client = RecordingHttpClient::new(body);
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(http_client)
+            .build()
+            .expect("build client");
+        let model = client.completion_model("gpt-4o-mini");
+        let request = model.completion_request("hello").build();
+
+        let error = model
+            .completion(request)
+            .await
+            .expect_err("failed response status should be rejected");
+
+        assert!(matches!(error, CompletionError::ProviderResponse(_)));
+        assert_eq!(error.provider_response_status(), Some(http::StatusCode::OK));
+        assert_eq!(error.provider_response_body(), Some(body));
+        let json = error
+            .provider_response_json()
+            .expect("raw body should be valid JSON")
+            .expect("parsed JSON should be present");
+        assert_eq!(
+            json["future_error_context"]["request_phase"],
+            "tool_execution"
+        );
+        assert_eq!(json["future_error_context"]["retryable"], false);
     }
 
     #[test]
