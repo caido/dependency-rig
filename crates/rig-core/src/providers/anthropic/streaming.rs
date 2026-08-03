@@ -7,15 +7,14 @@ use tracing_futures::Instrument;
 
 use super::completion::{
     AnthropicCompatibleProvider, AnthropicCompletionRequest, AnthropicRequestParams, CacheTtl,
-    Content, GenericCompletionModel, Usage,
+    Content, GenericCompletionModel, Usage, terminal_metadata_from_stop_reason,
+    thinking_tokens_from_raw_usage,
 };
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::http_client::{self, HttpClientExt};
 use crate::message::ReasoningContent;
-use crate::streaming::{
-    self, RawStreamingChoice, RawStreamingToolCall, StreamingResult, ToolCallDeltaContent,
-};
+use crate::streaming::{self, RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent};
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator};
 use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use std::collections::HashMap;
@@ -104,6 +103,14 @@ pub enum StreamingEvent {
 }
 
 #[derive(Debug, Deserialize)]
+struct StreamingEventEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct MessageStart {
     pub id: String,
     pub role: String,
@@ -160,14 +167,13 @@ impl GetTokenUsage for PartialUsage {
     fn token_usage(&self) -> crate::completion::Usage {
         let mut usage = crate::completion::Usage::new();
 
-        usage.input_tokens = self.input_tokens.unwrap_or_default() as u64;
-        usage.output_tokens = self.output_tokens as u64;
         usage.cached_input_tokens = self.cache_read_input_tokens.unwrap_or(0);
         usage.cache_creation_input_tokens = self.cache_creation_input_tokens.unwrap_or(0);
-        usage.total_tokens = usage.input_tokens
+        usage.input_tokens = self.input_tokens.unwrap_or_default() as u64
             + usage.cached_input_tokens
-            + usage.cache_creation_input_tokens
-            + usage.output_tokens;
+            + usage.cache_creation_input_tokens;
+        usage.output_tokens = self.output_tokens as u64;
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
         usage
     }
 }
@@ -200,17 +206,7 @@ pub struct StreamingCompletionResponse {
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> crate::completion::Usage {
-        let mut usage = crate::completion::Usage::new();
-        usage.input_tokens = self.usage.input_tokens.unwrap_or(0) as u64;
-        usage.output_tokens = self.usage.output_tokens as u64;
-        usage.cached_input_tokens = self.usage.cache_read_input_tokens.unwrap_or(0);
-        usage.cache_creation_input_tokens = self.usage.cache_creation_input_tokens.unwrap_or(0);
-        usage.total_tokens = usage.input_tokens
-            + usage.cached_input_tokens
-            + usage.cache_creation_input_tokens
-            + usage.output_tokens;
-
-        usage
+        self.usage.token_usage()
     }
 }
 
@@ -276,13 +272,19 @@ where
         let stream = GenericEventSource::new(self.client.clone(), req);
 
         // Use our SSE decoder to directly handle Server-Sent Events format
-        let stream: StreamingResult<StreamingCompletionResponse> = Box::pin(stream! {
+        let stream: streaming::InternalStreamingResult<StreamingCompletionResponse> = Box::pin(stream! {
             let mut current_tool_call: Option<ToolCallState> = None;
             let mut server_tool_uses: HashMap<usize, ServerToolUseState> = HashMap::new();
             let mut current_thinking: Option<ThinkingState> = None;
             let mut sse_stream = Box::pin(stream);
             let mut input_tokens = 0;
+            let mut cache_creation_input_tokens = None;
+            let mut cache_read_input_tokens = None;
+            let mut reasoning_tokens = None;
             let mut final_usage = None;
+            let mut final_stop_reason = None;
+            let mut stream_failed = false;
+            let mut saw_message_stop = false;
 
             let mut text_content = String::new();
 
@@ -290,34 +292,90 @@ where
                 match sse_result {
                     Ok(Event::Open) => {}
                     Ok(Event::Message(sse)) => {
+                        let raw_event = serde_json::from_str::<Value>(&sse.data).ok();
+                        if let Ok(envelope) =
+                            serde_json::from_str::<StreamingEventEnvelope>(&sse.data)
+                            && envelope.event_type == "error"
+                        {
+                            if let Some(message) = envelope
+                                .error
+                                .as_ref()
+                                .and_then(|error| error.get("message"))
+                                .and_then(Value::as_str)
+                            {
+                                tracing::warn!(
+                                    message,
+                                    "provider returned a streaming error event"
+                                );
+                            }
+                            stream_failed = true;
+                            yield Err(
+                                crate::provider_response::completion_error_from_body(sse.data),
+                            );
+                            break;
+                        }
+
                         // Parse the SSE data as a StreamingEvent
                         match serde_json::from_str::<StreamingEvent>(&sse.data) {
                             Ok(event) => {
                                 match &event {
                                     StreamingEvent::MessageStart { message } => {
                                         input_tokens = message.usage.input_tokens;
+                                        cache_creation_input_tokens =
+                                            message.usage.cache_creation_input_tokens;
+                                        cache_read_input_tokens =
+                                            message.usage.cache_read_input_tokens;
+                                        if let Some(tokens) = raw_event
+                                            .as_ref()
+                                            .and_then(|event| event.pointer("/message/usage"))
+                                            .and_then(thinking_tokens_from_raw_usage)
+                                        {
+                                            reasoning_tokens = Some(tokens);
+                                        }
 
                                         let span = tracing::Span::current();
                                         span.record("gen_ai.response.id", &message.id);
                                         span.record("gen_ai.response.model", &message.model);
                                     },
                                     StreamingEvent::MessageDelta { delta, usage } => {
-                                        if delta.stop_reason.is_some() {
-                                            // cache_creation_input_tokens and cache_read_input_tokens
-                                            // are cumulative totals on message_delta.usage per the
-                                            // Anthropic streaming API spec — use them directly.
+                                        if let Some(tokens) = raw_event
+                                            .as_ref()
+                                            .and_then(|event| event.get("usage"))
+                                            .and_then(thinking_tokens_from_raw_usage)
+                                        {
+                                            reasoning_tokens = Some(tokens);
+                                        }
+                                        if let Some(stop_reason) = delta.stop_reason.as_ref() {
+                                            final_stop_reason = Some(stop_reason.clone());
+                                            if let Some(final_input_tokens) = usage.input_tokens {
+                                                input_tokens = final_input_tokens as u64;
+                                            }
+                                            if usage.cache_creation_input_tokens.is_some() {
+                                                cache_creation_input_tokens =
+                                                    usage.cache_creation_input_tokens;
+                                            }
+                                            if usage.cache_read_input_tokens.is_some() {
+                                                cache_read_input_tokens =
+                                                    usage.cache_read_input_tokens;
+                                            }
+                                            // Input counters are cumulative when repeated in
+                                            // message_delta. Retain message_start counters when
+                                            // the terminal delta omits them.
                                             let usage = PartialUsage {
                                                  output_tokens: usage.output_tokens,
                                                  input_tokens: usize::try_from(input_tokens).ok(),
-                                                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                                 cache_read_input_tokens: usage.cache_read_input_tokens
+                                                 cache_creation_input_tokens,
+                                                 cache_read_input_tokens,
                                             };
 
                                             let span = tracing::Span::current();
                                             span.record_token_usage(&usage);
                                             final_usage = Some(usage);
-                                            break;
                                         }
+                                    }
+                                    StreamingEvent::MessageStop => {
+                                        saw_message_stop = true;
+                                        break;
                                     }
                                     _ => {}
                                 }
@@ -328,22 +386,34 @@ where
                                     &mut server_tool_uses,
                                     &mut current_thinking,
                                 ) {
-                                    if let Ok(RawStreamingChoice::Message(ref text)) = result {
-                                        text_content += text;
+                                    match result {
+                                        Ok(choice) => {
+                                            if let RawStreamingChoice::Message(ref text) = choice {
+                                                text_content += text;
+                                            }
+                                            yield Ok(streaming::InternalStreamingChoice::Raw(choice));
+                                        }
+                                        Err(error) => {
+                                            stream_failed = true;
+                                            yield Err(error);
+                                            break;
+                                        }
                                     }
-                                    yield result;
                                 }
                             },
                             Err(e) => {
                                 if !sse.data.trim().is_empty() {
+                                    stream_failed = true;
                                     yield Err(CompletionError::ResponseError(
                                         format!("Failed to parse JSON: {} (Data: {})", e, sse.data)
                                     ));
+                                    break;
                                 }
                             }
                         }
                     },
                     Err(e) => {
+                        stream_failed = true;
                         yield Err(CompletionError::from_stream_transport(e));
                         break;
                     }
@@ -353,12 +423,36 @@ where
             // Ensure event source is closed when stream ends
             sse_stream.close();
 
-            yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                usage: final_usage.unwrap_or_default()
-            }))
+            if stream_failed {
+                return;
+            }
+
+            if !saw_message_stop {
+                yield Err(CompletionError::ResponseError(
+                    "Anthropic stream ended before message_stop".to_string(),
+                ));
+                return;
+            }
+
+            let terminal_metadata =
+                terminal_metadata_from_stop_reason(final_stop_reason.as_deref());
+            let final_usage = final_usage.unwrap_or_default();
+            let mut normalized_usage = final_usage.token_usage();
+            normalized_usage.reasoning_tokens = reasoning_tokens.unwrap_or_default();
+            yield Ok(streaming::InternalStreamingChoice::Final {
+                response: StreamingCompletionResponse {
+                    usage: final_usage,
+                },
+                sidecar: streaming::StreamingFinalSidecar {
+                    terminal_metadata,
+                    normalized_usage: Some(normalized_usage),
+                },
+            })
         }.instrument(span));
 
-        Ok(streaming::StreamingCompletionResponse::stream(stream))
+        Ok(streaming::StreamingCompletionResponse::stream_internal(
+            stream,
+        ))
     }
 }
 
@@ -555,9 +649,17 @@ mod tests {
     };
     use super::*;
     use crate::OneOrMany;
+    use crate::client::CompletionClient;
+    use crate::completion::CompletionModel as _;
     use crate::completion::Message as RigMessage;
     use crate::completion::request::Document as RigDocument;
+    use crate::providers::internal::openai_chat_completions_compatible::test_support::{
+        sse_bytes_from_data_lines, sse_bytes_from_json_events,
+    };
+    use crate::streaming::StreamedAssistantContent;
+    use crate::test_utils::{MockStreamingClient, SequencedStreamingHttpClient};
     use async_stream::stream;
+    use bytes::Bytes;
     use futures::StreamExt;
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -577,6 +679,184 @@ mod tests {
         > + 'static,
     ) -> crate::streaming::StreamingResult<StreamingCompletionResponse> {
         Box::pin(stream)
+    }
+
+    async fn stream_from_sse_bytes(
+        sse_bytes: Bytes,
+    ) -> crate::streaming::StreamingCompletionResponse<StreamingCompletionResponse> {
+        let client = crate::providers::anthropic::Client::builder()
+            .http_client(MockStreamingClient { sse_bytes })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model(CLAUDE_OPUS_4_8);
+        let request = model.completion_request("hello").max_tokens(64).build();
+
+        model.stream(request).await.expect("stream should start")
+    }
+
+    async fn assert_stream_terminates_with_error(
+        mut stream: crate::streaming::StreamingCompletionResponse<StreamingCompletionResponse>,
+    ) -> CompletionError {
+        let error = loop {
+            match stream.next().await {
+                Some(Ok(StreamedAssistantContent::Final(_))) => {
+                    panic!("failed stream must not yield a final response")
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => break error,
+                None => panic!("failed stream must surface an error"),
+            }
+        };
+
+        assert!(
+            stream.next().await.is_none(),
+            "stream must terminate after its first error"
+        );
+        error
+    }
+
+    #[tokio::test]
+    async fn provider_error_event_is_terminal_and_preserves_raw_payload() {
+        let payload =
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let trailing_events = [
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}"#,
+            payload,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let stream = stream_from_sse_bytes(sse_bytes_from_data_lines(trailing_events)).await;
+
+        let error = assert_stream_terminates_with_error(stream).await;
+        assert!(matches!(error, CompletionError::ProviderResponse(_)));
+        assert_eq!(error.provider_response_body(), Some(payload));
+        assert_eq!(error.provider_response_status(), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_event_terminates_without_final_response() {
+        let events = [
+            "not json",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let stream = stream_from_sse_bytes(sse_bytes_from_data_lines(events)).await;
+
+        let error = assert_stream_terminates_with_error(stream).await;
+        assert!(matches!(error, CompletionError::ResponseError(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_stream_without_message_stop_is_an_error() {
+        let stream = stream_from_sse_bytes(Bytes::new()).await;
+
+        let error = assert_stream_terminates_with_error(stream).await;
+        assert!(matches!(error, CompletionError::ResponseError(_)));
+        assert!(error.to_string().contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_without_message_stop_is_an_error() {
+        let events = [
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "partial" }
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null
+                },
+                "usage": { "output_tokens": 3 }
+            }),
+        ];
+        let stream = stream_from_sse_bytes(sse_bytes_from_json_events(&events)).await;
+
+        let error = assert_stream_terminates_with_error(stream).await;
+        assert!(matches!(error, CompletionError::ResponseError(_)));
+        assert!(error.to_string().contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn transport_error_terminates_without_final_response() {
+        let client = crate::providers::anthropic::Client::builder()
+            .http_client(SequencedStreamingHttpClient::new(vec![
+                Ok(sse_bytes_from_json_events(&[
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "text_delta", "text": "partial" }
+                    }),
+                    json!({
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": "end_turn",
+                            "stop_sequence": null
+                        },
+                        "usage": { "output_tokens": 3 }
+                    }),
+                ])),
+                Err(http_client::Error::StreamEnded),
+            ]))
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model(CLAUDE_OPUS_4_8);
+        let request = model.completion_request("hello").max_tokens(64).build();
+        let stream = model.stream(request).await.expect("stream should start");
+
+        let error = assert_stream_terminates_with_error(stream).await;
+        assert!(matches!(error, CompletionError::ProviderError(_)));
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_aggregates_message_start_cache_and_thinking_tokens() {
+        let events = [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [],
+                    "model": CLAUDE_OPUS_4_8,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": 11,
+                        "cache_read_input_tokens": 7,
+                        "cache_creation_input_tokens": 5,
+                        "output_tokens": 0
+                    }
+                }
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "output_tokens": 3,
+                    "output_tokens_details": { "thinking_tokens": 2 }
+                }
+            }),
+            json!({ "type": "message_stop" }),
+        ];
+        let mut stream = stream_from_sse_bytes(sse_bytes_from_json_events(&events)).await;
+
+        while let Some(item) = stream.next().await {
+            item.expect("stream should complete successfully");
+        }
+
+        let usage = stream.usage();
+        assert_eq!(usage.input_tokens, 23);
+        assert_eq!(usage.cached_input_tokens, 7);
+        assert_eq!(usage.cache_creation_input_tokens, 5);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 26);
+        assert_eq!(usage.reasoning_tokens, 2);
     }
 
     #[test]

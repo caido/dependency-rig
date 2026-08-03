@@ -5,7 +5,7 @@ use crate::providers::anthropic::streaming::StreamingCompletionResponse;
 use crate::{
     OneOrMany,
     client::Provider,
-    completion::{self, CompletionError, GetTokenUsage},
+    completion::{self, CompletionError, GetCompletionMetadata, GetTokenUsage},
     http_client::HttpClientExt,
     message::{self, DocumentMediaType, DocumentSourceKind, MessageError, MimeType, Reasoning},
     one_or_many::string_or_one_or_many,
@@ -64,6 +64,12 @@ pub struct CompletionResponse {
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
     pub usage: Usage,
+}
+
+impl GetCompletionMetadata for CompletionResponse {
+    fn terminal_metadata(&self) -> Option<completion::CompletionTerminalMetadata> {
+        terminal_metadata_from_stop_reason(self.stop_reason.as_deref())
+    }
 }
 
 impl ProviderResponseExt for CompletionResponse {
@@ -134,17 +140,30 @@ impl GetTokenUsage for Usage {
     fn token_usage(&self) -> crate::completion::Usage {
         let mut usage = crate::completion::Usage::new();
 
-        usage.input_tokens = self.input_tokens;
-        usage.output_tokens = self.output_tokens;
         usage.cached_input_tokens = self.cache_read_input_tokens.unwrap_or_default();
         usage.cache_creation_input_tokens = self.cache_creation_input_tokens.unwrap_or_default();
-        usage.total_tokens = self.input_tokens
-            + self.cache_read_input_tokens.unwrap_or_default()
-            + self.cache_creation_input_tokens.unwrap_or_default()
-            + self.output_tokens;
+        usage.input_tokens =
+            self.input_tokens + usage.cached_input_tokens + usage.cache_creation_input_tokens;
+        usage.output_tokens = self.output_tokens;
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
 
         usage
     }
+}
+
+pub(super) fn thinking_tokens_from_raw_usage(raw_usage: &serde_json::Value) -> Option<u64> {
+    raw_usage
+        .pointer("/output_tokens_details/thinking_tokens")
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn normalized_usage_from_raw(raw_response: &serde_json::Value, usage: &Usage) -> completion::Usage {
+    let mut normalized = usage.token_usage();
+    normalized.reasoning_tokens = raw_response
+        .get("usage")
+        .and_then(thinking_tokens_from_raw_usage)
+        .unwrap_or_default();
+    normalized
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -240,18 +259,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 .map_err(|_| CompletionError::ResponseError(EMPTY_RESPONSE_ERROR.to_owned()))?
         };
 
-        let usage = completion::Usage {
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            total_tokens: response.usage.input_tokens
-                + response.usage.cache_read_input_tokens.unwrap_or(0)
-                + response.usage.cache_creation_input_tokens.unwrap_or(0)
-                + response.usage.output_tokens,
-            cached_input_tokens: response.usage.cache_read_input_tokens.unwrap_or(0),
-            cache_creation_input_tokens: response.usage.cache_creation_input_tokens.unwrap_or(0),
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
-        };
+        let usage = response.usage.token_usage();
 
         Ok(completion::CompletionResponse {
             choice,
@@ -260,6 +268,23 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             message_id: None,
         })
     }
+}
+
+pub(crate) fn terminal_metadata_from_stop_reason(
+    raw_reason: Option<&str>,
+) -> Option<completion::CompletionTerminalMetadata> {
+    let raw_reason = raw_reason?;
+    let reason = match raw_reason {
+        "end_turn" | "stop_sequence" => completion::CompletionFinishReason::Stop,
+        "max_tokens" | "model_context_window_exceeded" => {
+            completion::CompletionFinishReason::Length
+        }
+        "tool_use" => completion::CompletionFinishReason::ToolCalls,
+        "refusal" => completion::CompletionFinishReason::ContentFilter,
+        _ => completion::CompletionFinishReason::Unknown,
+    };
+
+    Some(completion::CompletionTerminalMetadata::new(reason).with_raw_reason(raw_reason))
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -1140,6 +1165,9 @@ fn anthropic_content_from_assistant_content(
         message::AssistantContent::Reasoning(reasoning) => {
             let mut converted = Vec::new();
             for block in reasoning.content {
+                let Some(block) = block.into_provider_content() else {
+                    continue;
+                };
                 match block {
                     message::ReasoningContent::Text { text, signature } => {
                         converted.push(Content::Thinking {
@@ -1157,6 +1185,7 @@ fn anthropic_content_from_assistant_content(
                     | message::ReasoningContent::Encrypted(data) => {
                         converted.push(Content::RedactedThinking { data });
                     }
+                    message::ReasoningContent::ProviderData { .. } => continue,
                 }
             }
 
@@ -1574,7 +1603,8 @@ where
 {
     pub fn new(client: crate::client::Client<Ext, T>, model: impl Into<String>) -> Self {
         let model = model.into();
-        let default_max_tokens = Ext::default_max_tokens(&model);
+        let default_max_tokens = Ext::default_max_tokens(&model)
+            .or_else(|| Some(default_max_tokens_with_fallback(&model)));
 
         Self {
             client,
@@ -2633,8 +2663,11 @@ where
                 ));
             }
 
-            match serde_json::from_slice::<ApiResponse<CompletionResponse>>(&body)? {
+            let raw_response = serde_json::from_slice::<serde_json::Value>(&body)?;
+            match serde_json::from_value::<ApiResponse<CompletionResponse>>(raw_response.clone())? {
                 ApiResponse::Message(completion) => {
+                    let normalized_usage =
+                        normalized_usage_from_raw(&raw_response, &completion.usage);
                     let span = tracing::Span::current();
                     span.record_response_metadata(&completion);
                     span.record_token_usage(&completion.usage);
@@ -2645,7 +2678,10 @@ where
                             serde_json::to_string_pretty(&completion)?
                         );
                     }
-                    completion.try_into()
+                    let mut response: completion::CompletionResponse<CompletionResponse> =
+                        completion.try_into()?;
+                    response.usage = normalized_usage;
+                    Ok(response)
                 }
                 ApiResponse::Error(ApiErrorResponse { message }) => {
                     tracing::warn!(message = %message, "provider returned an error response");
@@ -2705,6 +2741,21 @@ mod tests {
     fn unknown_model_uses_conservative_default_max_tokens_fallback() {
         assert_eq!(default_max_tokens_for_model("claude-unknown"), None);
         assert_eq!(default_max_tokens_with_fallback("claude-unknown"), 2_048);
+    }
+
+    #[test]
+    fn new_uses_conservative_default_for_unknown_models() {
+        use crate::providers::anthropic::Client;
+        use crate::test_utils::RecordingHttpClient;
+
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(RecordingHttpClient::new("{}"))
+            .build()
+            .expect("client should build");
+        let model = GenericCompletionModel::new(client, "custom-claude-compatible-model");
+
+        assert_eq!(model.default_max_tokens, Some(2_048));
     }
 
     #[test]
@@ -5159,6 +5210,7 @@ mod tests {
     fn test_assistant_reasoning_multiblock_to_anthropic_content() {
         let reasoning = message::Reasoning {
             id: None,
+            additional_params: None,
             content: vec![
                 message::ReasoningContent::Text {
                     text: "step one".to_string(),
@@ -5226,6 +5278,7 @@ mod tests {
     fn test_assistant_encrypted_reasoning_maps_to_redacted_thinking() {
         let reasoning = message::Reasoning {
             id: None,
+            additional_params: None,
             content: vec![message::ReasoningContent::Encrypted(
                 "ciphertext".to_string(),
             )],
@@ -6144,6 +6197,51 @@ mod tests {
         };
 
         assert_eq!(document.additional_params, None);
+    }
+
+    #[tokio::test]
+    async fn blocking_usage_aggregates_cache_segments_and_preserves_thinking_tokens() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::anthropic::Client;
+        use crate::test_utils::RecordingHttpClient;
+
+        let body = json!({
+            "type": "message",
+            "content": [{ "type": "text", "text": "hello" }],
+            "id": "msg_1",
+            "model": CLAUDE_OPUS_4_8,
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 11,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 5,
+                "output_tokens": 3,
+                "output_tokens_details": { "thinking_tokens": 2 }
+            }
+        })
+        .to_string();
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(RecordingHttpClient::new(body))
+            .build()
+            .expect("client should build");
+        let model = client.completion_model(CLAUDE_OPUS_4_8);
+        let request = model.completion_request("hello").build();
+
+        let response = model
+            .completion(request)
+            .await
+            .expect("completion should succeed");
+
+        assert_eq!(response.usage.input_tokens, 23);
+        assert_eq!(response.usage.cached_input_tokens, 7);
+        assert_eq!(response.usage.cache_creation_input_tokens, 5);
+        assert_eq!(response.usage.output_tokens, 3);
+        assert_eq!(response.usage.total_tokens, 26);
+        assert_eq!(response.usage.reasoning_tokens, 2);
     }
 
     #[tokio::test]
