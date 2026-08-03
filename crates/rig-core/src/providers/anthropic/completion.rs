@@ -1749,6 +1749,40 @@ impl TryFrom<message::ToolChoice> for ToolChoice {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolChoiceConfig {
+    #[serde(flatten)]
+    choice: ToolChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_parallel_tool_use: Option<bool>,
+}
+
+impl ToolChoiceConfig {
+    fn from_request(
+        tool_choice: Option<message::ToolChoice>,
+        parallel_tool_calls: Option<bool>,
+    ) -> Result<Option<Self>, CompletionError> {
+        if tool_choice.is_none() && parallel_tool_calls.is_none() {
+            return Ok(None);
+        }
+
+        let choice = tool_choice
+            .map(ToolChoice::try_from)
+            .transpose()?
+            .unwrap_or_default();
+        let disable_parallel_tool_use = if matches!(choice, ToolChoice::None) {
+            None
+        } else {
+            parallel_tool_calls.map(|parallel| !parallel)
+        };
+
+        Ok(Some(Self {
+            choice,
+            disable_parallel_tool_use,
+        }))
+    }
+}
+
 /// Recursively ensures all object schemas respect Anthropic structured output restrictions:
 /// - `additionalProperties` must be explicitly set to `false` on every object
 /// - All properties must be listed in `required`
@@ -1861,7 +1895,7 @@ pub(super) struct AnthropicCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<ToolChoice>,
+    tool_choice: Option<ToolChoiceConfig>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2388,6 +2422,7 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             automatic_caching_ttl,
         } = params;
         let chat_history = req.chat_history_with_documents();
+        let parallel_tool_calls = req.take_parallel_tool_calls()?;
 
         // Check if max_tokens is set, required for Anthropic
         let Some(max_tokens) = req.max_tokens else {
@@ -2444,13 +2479,16 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             top_level_cache_control.as_ref(),
         )?;
 
+        let tool_choice = ToolChoiceConfig::from_request(req.tool_choice, parallel_tool_calls)?
+            .filter(|_| !tools.is_empty());
+
         Ok(Self {
             model: model.to_string(),
             messages,
             max_tokens,
             system,
             temperature: req.temperature,
-            tool_choice: req.tool_choice.map(ToolChoice::try_from).transpose()?,
+            tool_choice,
             tools,
             output_config,
             // Automatic caching: one top-level field; the API moves the breakpoint automatically.
@@ -3146,6 +3184,71 @@ mod tests {
             output_schema: None,
             record_telemetry_content: false,
         }
+    }
+
+    #[test]
+    fn request_inverts_parallel_tool_calls_for_anthropic_wire_format() {
+        for (parallel_tool_calls, disable_parallel_tool_use) in [(true, false), (false, true)] {
+            let mut request = completion_request_with_tools(vec![generic_tool("lookup")], None);
+            request.additional_params = Some(json!({
+                "parallel_tool_calls": parallel_tool_calls
+            }));
+
+            let request = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+                model: CLAUDE_OPUS_4_8,
+                request,
+                prompt_caching: false,
+                automatic_caching: false,
+                automatic_caching_ttl: None,
+            })
+            .expect("request conversion should succeed");
+            let serialized = serde_json::to_value(request).expect("request should serialize");
+
+            assert_eq!(
+                serialized["tool_choice"]["disable_parallel_tool_use"],
+                disable_parallel_tool_use
+            );
+        }
+    }
+
+    #[test]
+    fn tool_choice_none_omits_disable_parallel_tool_use() {
+        let mut request = completion_request_with_tools(vec![generic_tool("lookup")], None);
+        request.tool_choice = Some(message::ToolChoice::None);
+        request.additional_params = Some(json!({ "parallel_tool_calls": false }));
+
+        let request = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+            model: CLAUDE_OPUS_4_8,
+            request,
+            prompt_caching: false,
+            automatic_caching: false,
+            automatic_caching_ttl: None,
+        })
+        .expect("request conversion should succeed");
+        let serialized = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(serialized["tool_choice"], json!({ "type": "none" }));
+    }
+
+    #[test]
+    fn blocking_body_drops_tool_controls_when_no_tools_are_advertised() {
+        let mut request = completion_request_with_tools(Vec::new(), None);
+        request.tool_choice = Some(message::ToolChoice::Auto);
+        request.additional_params = Some(json!({ "parallel_tool_calls": false }));
+
+        let request = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+            model: CLAUDE_OPUS_4_8,
+            request,
+            prompt_caching: false,
+            automatic_caching: false,
+            automatic_caching_ttl: None,
+        })
+        .expect("request conversion should succeed");
+        let serialized = serde_json::to_value(request).expect("request should serialize");
+
+        assert!(serialized.get("tools").is_none());
+        assert!(serialized.get("tool_choice").is_none());
+        assert!(!serialized.to_string().contains("disable_parallel_tool_use"));
     }
 
     fn test_output_schema() -> schemars::Schema {

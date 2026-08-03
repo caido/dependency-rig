@@ -497,7 +497,11 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u64>,
     /// Whether tools are required to be used by the model provider or not before providing a response.
     pub tool_choice: Option<ToolChoice>,
-    /// Additional provider-specific parameters to be sent to the completion model provider
+    /// Additional provider-specific parameters to be sent to the completion model provider.
+    ///
+    /// `parallel_tool_calls` is a reserved portable Rig option and must be a
+    /// JSON boolean. Provider adapters consume it before building their wire
+    /// request, translating or dropping it according to provider support.
     pub additional_params: Option<serde_json::Value>,
     /// Optional JSON Schema for structured output. When set, providers that support
     /// native structured outputs will constrain the model's response to match this schema.
@@ -851,6 +855,18 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
         self
     }
 
+    /// Sets whether the model provider may call multiple tools in parallel.
+    pub fn parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
+        set_parallel_tool_calls(&mut self.additional_params, Some(parallel_tool_calls));
+        self
+    }
+
+    /// Sets whether the model provider may call multiple tools in parallel.
+    pub fn parallel_tool_calls_opt(mut self, parallel_tool_calls: Option<bool>) -> Self {
+        set_parallel_tool_calls(&mut self.additional_params, parallel_tool_calls);
+        self
+    }
+
     /// Sets the output schema for structured output. When set, providers that support
     /// native structured outputs will constrain the model's response to match this schema.
     /// NOTE: For direct type conversion, you may want to use `Agent::prompt_typed()` - using this method
@@ -962,6 +978,57 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
     }
 }
 
+fn set_parallel_tool_calls(
+    additional_params: &mut Option<serde_json::Value>,
+    parallel_tool_calls: Option<bool>,
+) {
+    match parallel_tool_calls {
+        Some(parallel_tool_calls) => {
+            let mut params = match additional_params.take() {
+                Some(serde_json::Value::Object(params)) => params,
+                Some(serde_json::Value::Bool(stream)) => {
+                    let mut params = serde_json::Map::new();
+                    params.insert("stream".to_string(), serde_json::Value::Bool(stream));
+                    params
+                }
+                _ => serde_json::Map::new(),
+            };
+            params.insert(
+                "parallel_tool_calls".to_string(),
+                serde_json::Value::Bool(parallel_tool_calls),
+            );
+            *additional_params = Some(serde_json::Value::Object(params));
+        }
+        None => {
+            if let Some(serde_json::Value::Object(params)) = additional_params {
+                params.remove("parallel_tool_calls");
+            }
+        }
+    }
+}
+
+impl CompletionRequest {
+    pub(crate) fn take_parallel_tool_calls(&mut self) -> Result<Option<bool>, CompletionError> {
+        let Some(serde_json::Value::Object(params)) = self.additional_params.as_mut() else {
+            return Ok(None);
+        };
+        let Some(value) = params.get("parallel_tool_calls") else {
+            return Ok(None);
+        };
+        let value = value.as_bool().ok_or_else(|| {
+            CompletionError::RequestError(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "additional_params.parallel_tool_calls must be a boolean",
+                )
+                .into(),
+            )
+        })?;
+        params.remove("parallel_tool_calls");
+        Ok(Some(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -977,6 +1044,78 @@ mod tests {
 
     use super::*;
     use crate::test_utils::MockCompletionModel;
+
+    #[test]
+    fn parallel_tool_calls_builder_preserves_existing_params() {
+        let request =
+            CompletionRequestBuilder::new(MockCompletionModel::default(), "completion prompt")
+                .additional_params(serde_json::json!({ "sentinel": "keep" }))
+                .parallel_tool_calls(false)
+                .build();
+
+        assert_eq!(
+            request.additional_params,
+            Some(serde_json::json!({
+                "sentinel": "keep",
+                "parallel_tool_calls": false
+            }))
+        );
+
+        let request =
+            CompletionRequestBuilder::new(MockCompletionModel::default(), "completion prompt")
+                .additional_params_opt(Some(serde_json::Value::Bool(true)))
+                .parallel_tool_calls(true)
+                .build();
+
+        assert_eq!(
+            request.additional_params,
+            Some(serde_json::json!({
+                "stream": true,
+                "parallel_tool_calls": true
+            }))
+        );
+    }
+
+    #[test]
+    fn clearing_parallel_tool_calls_preserves_unrelated_params() {
+        let request =
+            CompletionRequestBuilder::new(MockCompletionModel::default(), "completion prompt")
+                .additional_params(serde_json::json!({
+                    "sentinel": "keep",
+                    "parallel_tool_calls": true
+                }))
+                .parallel_tool_calls_opt(None)
+                .build();
+
+        assert_eq!(
+            request.additional_params,
+            Some(serde_json::json!({ "sentinel": "keep" }))
+        );
+    }
+
+    #[test]
+    fn invalid_parallel_tool_calls_is_not_removed() {
+        let mut request =
+            CompletionRequestBuilder::new(MockCompletionModel::default(), "completion prompt")
+                .additional_params(serde_json::json!({
+                    "sentinel": "keep",
+                    "parallel_tool_calls": "invalid"
+                }))
+                .build();
+
+        let error = request
+            .take_parallel_tool_calls()
+            .expect_err("a non-boolean parallel tool control must be rejected");
+
+        assert!(matches!(error, CompletionError::RequestError(_)));
+        assert_eq!(
+            request.additional_params,
+            Some(serde_json::json!({
+                "sentinel": "keep",
+                "parallel_tool_calls": "invalid"
+            }))
+        );
+    }
 
     #[test]
     fn completion_request_content_telemetry_is_opt_in_and_not_serialized() {

@@ -1161,6 +1161,7 @@ impl TryFrom<ResponsesRequestParams> for CompletionRequest {
             system_instructions_placement,
         } = params;
         let chat_history = req.chat_history_with_documents();
+        let parallel_tool_calls = req.take_parallel_tool_calls()?;
         let model = req.model.clone().unwrap_or(model);
         let preamble = req.preamble.take();
         let mut instruction_parts = Vec::new();
@@ -1279,6 +1280,9 @@ impl TryFrom<ResponsesRequestParams> for CompletionRequest {
             {
                 include.push(Include::ReasoningEncryptedContent);
             }
+        }
+        if parallel_tool_calls.is_some() {
+            additional_parameters.parallel_tool_calls = parallel_tool_calls;
         }
 
         // Apply output_schema as structured output if not already configured via additional_params
@@ -3054,6 +3058,18 @@ mod tests {
             output_schema: None,
             record_telemetry_content: false,
         }
+    }
+
+    #[test]
+    fn responses_request_serializes_parallel_tool_calls() {
+        let mut request = weather_tool_request();
+        request.additional_params = Some(json!({ "parallel_tool_calls": false }));
+
+        let request = CompletionRequest::try_from(("gpt-4o-mini".to_owned(), request))
+            .expect("request conversion should succeed");
+        let serialized = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(serialized["parallel_tool_calls"], false);
     }
 
     #[test]

@@ -1748,13 +1748,14 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
     fn try_from(params: OpenAIRequestParams) -> Result<Self, Self::Error> {
         let OpenAIRequestParams {
             model,
-            request: req,
+            request: mut req,
             strict_tools,
             tool_result_array_content,
             supports_response_format,
             supports_tools,
         } = params;
         let chat_history = req.chat_history_with_documents();
+        let parallel_tool_calls = req.take_parallel_tool_calls()?;
 
         let CoreCompletionRequest {
             model: request_model,
@@ -1809,7 +1810,7 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
 
         let history_has_tool_result = history_contains_tool_result(&full_history);
 
-        let (tools, tool_choice) = if supports_tools {
+        let (tools, tool_choice, parallel_tool_calls) = if supports_tools {
             let tool_choice = tool_choice.map(ToolChoice::try_from).transpose()?;
             let tools: Vec<ToolDefinition> = tools
                 .into_iter()
@@ -1818,7 +1819,7 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
                     if strict_tools { def.with_strict() } else { def }
                 })
                 .collect();
-            (tools, tool_choice)
+            (tools, tool_choice, parallel_tool_calls)
         } else {
             if !tools.is_empty() {
                 tracing::warn!("Tool use is not supported by this provider; tools will be ignored");
@@ -1826,7 +1827,12 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
             if tool_choice.is_some() {
                 tracing::warn!("Tool choice is not supported by this provider and will be ignored");
             }
-            (Vec::new(), None)
+            if parallel_tool_calls.is_some() {
+                tracing::warn!(
+                    "Parallel tool calls are not supported by this provider and will be ignored"
+                );
+            }
+            (Vec::new(), None, None)
         };
 
         if output_schema.is_some() && !supports_response_format {
@@ -1867,6 +1873,18 @@ impl TryFrom<OpenAIRequestParams> for CompletionRequest {
             Some(match additional_params {
                 Some(existing) => json_utils::merge(existing, response_format),
                 None => response_format,
+            })
+        } else {
+            additional_params
+        };
+
+        let additional_params = if let Some(parallel_tool_calls) = parallel_tool_calls {
+            let parallel_tool_calls = serde_json::json!({
+                "parallel_tool_calls": parallel_tool_calls
+            });
+            Some(match additional_params {
+                Some(existing) => json_utils::merge(existing, parallel_tool_calls),
+                None => parallel_tool_calls,
             })
         } else {
             additional_params
@@ -2089,6 +2107,58 @@ mod tests {
             output_schema: None,
             record_telemetry_content: false,
         }
+    }
+
+    #[test]
+    fn request_serializes_parallel_tool_calls() {
+        let request = CoreCompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::one(message::Message::user("Hello")),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: Some(serde_json::json!({ "parallel_tool_calls": false })),
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+
+        let request = CompletionRequest::try_from(("gpt-4o-mini".to_owned(), request))
+            .expect("request conversion should succeed");
+        let serialized = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(serialized["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn request_omits_parallel_tool_calls_when_tools_are_unsupported() {
+        let request = CoreCompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::one(message::Message::user("Hello")),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: Some(serde_json::json!({ "parallel_tool_calls": true })),
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        let request = CompletionRequest::try_from(OpenAIRequestParams {
+            model: "no-tools".to_owned(),
+            request,
+            strict_tools: false,
+            tool_result_array_content: false,
+            supports_response_format: true,
+            supports_tools: false,
+        })
+        .expect("request conversion should succeed");
+        let serialized = serde_json::to_value(request).expect("request should serialize");
+
+        assert!(serialized.get("parallel_tool_calls").is_none());
     }
 
     #[test]

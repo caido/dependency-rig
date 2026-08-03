@@ -1352,10 +1352,11 @@ impl TryFrom<OpenRouterRequestParams<'_>> for OpenrouterCompletionRequest {
     fn try_from(params: OpenRouterRequestParams) -> Result<Self, Self::Error> {
         let OpenRouterRequestParams {
             model,
-            request: req,
+            request: mut req,
             strict_tools,
         } = params;
         let chat_history = req.chat_history_with_documents();
+        let parallel_tool_calls = req.take_parallel_tool_calls()?;
         let model = req.model.clone().unwrap_or_else(|| model.to_string());
 
         let mut full_history: Vec<Message> = match &req.preamble {
@@ -1414,6 +1415,18 @@ impl TryFrom<OpenRouterRequestParams<'_>> for OpenrouterCompletionRequest {
             })
         } else {
             req.additional_params
+        };
+
+        let additional_params = if let Some(parallel_tool_calls) = parallel_tool_calls {
+            let parallel_tool_calls = serde_json::json!({
+                "parallel_tool_calls": parallel_tool_calls
+            });
+            Some(match additional_params {
+                Some(existing) => json_utils::merge(existing, parallel_tool_calls),
+                None => parallel_tool_calls,
+            })
+        } else {
+            additional_params
         };
 
         Ok(Self {

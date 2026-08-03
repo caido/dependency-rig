@@ -218,9 +218,12 @@ where
 }
 
 pub(crate) fn create_request_body(
-    completion_request: CompletionRequest,
+    mut completion_request: CompletionRequest,
 ) -> Result<GenerateContentRequest, CompletionError> {
     let chat_history = completion_request.chat_history_with_documents();
+    if completion_request.take_parallel_tool_calls()?.is_some() {
+        tracing::warn!("Parallel tool calls are not supported by Gemini and will be ignored");
+    }
 
     let CompletionRequest {
         model: _,
