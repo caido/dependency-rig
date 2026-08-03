@@ -8,8 +8,8 @@ use super::completion::gemini_api_types::{
     ContentCandidate, FinishReason, ModalityTokenCount, Part, PartKind, TrafficType,
 };
 use super::completion::{
-    CompletionModel, create_request_body, function_call_finish_reason_error, resolve_request_model,
-    streaming_endpoint,
+    CompletionModel, create_request_body, function_call_finish_reason_error,
+    normalized_token_usage, resolve_request_model, streaming_endpoint,
 };
 use crate::completion::message::ReasoningContent;
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
@@ -47,16 +47,14 @@ pub struct PartialUsage {
 
 impl GetTokenUsage for PartialUsage {
     fn token_usage(&self) -> crate::completion::Usage {
-        let mut usage = crate::completion::Usage::new();
-
-        usage.input_tokens = self.prompt_token_count as u64;
-        usage.output_tokens = self.candidates_token_count.unwrap_or_default() as u64;
-        usage.cached_input_tokens = self.cached_content_token_count.unwrap_or_default() as u64;
-        usage.reasoning_tokens = self.thoughts_token_count.unwrap_or_default() as u64;
-        usage.tool_use_prompt_tokens = self.tool_use_prompt_token_count.unwrap_or_default() as u64;
-        usage.total_tokens = self.total_token_count as u64;
-
-        usage
+        normalized_token_usage(
+            self.prompt_token_count,
+            self.candidates_token_count,
+            self.total_token_count,
+            self.cached_content_token_count,
+            self.thoughts_token_count,
+            self.tool_use_prompt_token_count,
+        )
     }
 }
 
@@ -671,7 +669,7 @@ mod tests {
     #[test]
     fn test_partial_usage_token_calculation() {
         let usage = PartialUsage {
-            total_token_count: 100,
+            total_token_count: 92,
             cached_content_token_count: Some(20),
             candidates_token_count: Some(30),
             thoughts_token_count: Some(10),
@@ -685,12 +683,12 @@ mod tests {
         };
 
         let token_usage = usage.token_usage();
-        assert_eq!(token_usage.input_tokens, 40);
+        assert_eq!(token_usage.input_tokens, 52);
         assert_eq!(token_usage.cached_input_tokens, 20);
-        assert_eq!(token_usage.output_tokens, 30);
+        assert_eq!(token_usage.output_tokens, 40);
         assert_eq!(token_usage.reasoning_tokens, 10);
         assert_eq!(token_usage.tool_use_prompt_tokens, 12);
-        assert_eq!(token_usage.total_tokens, 100);
+        assert_eq!(token_usage.total_tokens, 92);
     }
 
     #[test]
@@ -718,6 +716,46 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_usage_normalizes_zero_and_null_counts() {
+        for (payload, expected_input, expected_output, expected_reasoning, expected_total) in [
+            (
+                json!({
+                    "promptTokenCount": 0,
+                    "toolUsePromptTokenCount": 0,
+                    "candidatesTokenCount": 0,
+                    "thoughtsTokenCount": 0,
+                    "totalTokenCount": 0
+                }),
+                0,
+                0,
+                0,
+                0,
+            ),
+            (
+                json!({
+                    "promptTokenCount": 20,
+                    "toolUsePromptTokenCount": null,
+                    "candidatesTokenCount": null,
+                    "thoughtsTokenCount": null,
+                    "totalTokenCount": 20
+                }),
+                20,
+                0,
+                0,
+                20,
+            ),
+        ] {
+            let usage: PartialUsage = serde_json::from_value(payload).unwrap();
+            let usage = usage.token_usage();
+
+            assert_eq!(usage.input_tokens, expected_input);
+            assert_eq!(usage.output_tokens, expected_output);
+            assert_eq!(usage.reasoning_tokens, expected_reasoning);
+            assert_eq!(usage.total_tokens, expected_total);
+        }
+    }
+
+    #[test]
     fn test_partial_usage_deserializes_without_total_token_count() {
         // Gemini's proto3-JSON encoding omits fields whose value is the default (0),
         // so `totalTokenCount` is absent on short/empty/blocked generations.
@@ -725,6 +763,9 @@ mod tests {
             serde_json::from_str(r#"{"promptTokenCount": 12}"#).expect("should deserialize");
         assert_eq!(usage.total_token_count, 0);
         assert_eq!(usage.prompt_token_count, 12);
+        let usage = usage.token_usage();
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.total_tokens, 0);
     }
 
     #[test]
@@ -797,7 +838,7 @@ mod tests {
             "cachedContentTokenCount": 25,
             "candidatesTokenCount": 50,
             "thoughtsTokenCount": 15,
-            "totalTokenCount": 190,
+            "totalTokenCount": 177,
             "promptTokensDetails": [
                 { "modality": "TEXT", "tokenCount": 80 },
                 { "modality": "IMAGE", "tokenCount": 20 }
@@ -820,7 +861,7 @@ mod tests {
         assert_eq!(usage.cached_content_token_count, Some(25));
         assert_eq!(usage.candidates_token_count, Some(50));
         assert_eq!(usage.thoughts_token_count, Some(15));
-        assert_eq!(usage.total_token_count, 190);
+        assert_eq!(usage.total_token_count, 177);
         assert!(usage.prompt_tokens_details.is_some());
         assert_eq!(usage.prompt_tokens_details.as_ref().unwrap().len(), 2);
         assert!(usage.cache_tokens_details.is_some());
@@ -833,11 +874,11 @@ mod tests {
         ));
 
         let token_usage = usage.token_usage();
-        assert_eq!(token_usage.input_tokens, 100);
+        assert_eq!(token_usage.input_tokens, 112);
         assert_eq!(token_usage.cached_input_tokens, 25);
-        assert_eq!(token_usage.output_tokens, 50);
+        assert_eq!(token_usage.output_tokens, 65);
         assert_eq!(token_usage.reasoning_tokens, 15);
         assert_eq!(token_usage.tool_use_prompt_tokens, 12);
-        assert_eq!(token_usage.total_tokens, 190);
+        assert_eq!(token_usage.total_tokens, 177);
     }
 }

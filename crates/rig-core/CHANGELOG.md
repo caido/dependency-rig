@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - *(anthropic)* merge raw output controls with native structured-output configuration
+- *(gemini)* Include tool-use prompt tokens in normalized input usage and thought tokens in
+  normalized output usage for blocking and streaming completions while preserving their separate
+  detail counts.
 
 ## [0.41.0](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.40.0...rig-core-v0.41.0) - 2026-07-28
 

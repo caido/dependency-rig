@@ -54,6 +54,37 @@ use super::Client;
 // Rig Implementation Types
 // =================================================================
 
+fn nonnegative_token_count(token_count: i32) -> u64 {
+    token_count.try_into().unwrap_or_default()
+}
+
+pub(super) fn normalized_token_usage(
+    prompt_token_count: i32,
+    candidates_token_count: Option<i32>,
+    total_token_count: i32,
+    cached_content_token_count: Option<i32>,
+    thoughts_token_count: Option<i32>,
+    tool_use_prompt_token_count: Option<i32>,
+) -> crate::completion::Usage {
+    let prompt_tokens = nonnegative_token_count(prompt_token_count);
+    let candidates_tokens = nonnegative_token_count(candidates_token_count.unwrap_or_default());
+    let reasoning_tokens = nonnegative_token_count(thoughts_token_count.unwrap_or_default());
+    let tool_use_prompt_tokens =
+        nonnegative_token_count(tool_use_prompt_token_count.unwrap_or_default());
+
+    crate::completion::Usage {
+        input_tokens: prompt_tokens + tool_use_prompt_tokens,
+        output_tokens: candidates_tokens + reasoning_tokens,
+        total_tokens: nonnegative_token_count(total_token_count),
+        cached_input_tokens: nonnegative_token_count(
+            cached_content_token_count.unwrap_or_default(),
+        ),
+        cache_creation_input_tokens: 0,
+        tool_use_prompt_tokens,
+        reasoning_tokens,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CompletionModel<T = reqwest::Client> {
     pub(crate) client: Client<T>,
@@ -1426,17 +1457,14 @@ pub mod gemini_api_types {
 
     impl GetTokenUsage for UsageMetadata {
         fn token_usage(&self) -> crate::completion::Usage {
-            let mut usage = crate::completion::Usage::new();
-
-            usage.input_tokens = self.prompt_token_count as u64;
-            usage.output_tokens = self.candidates_token_count.unwrap_or_default() as u64;
-            usage.cached_input_tokens = self.cached_content_token_count.unwrap_or_default() as u64;
-            usage.reasoning_tokens = self.thoughts_token_count.unwrap_or_default() as u64;
-            usage.tool_use_prompt_tokens =
-                self.tool_use_prompt_token_count.unwrap_or_default() as u64;
-            usage.total_tokens = self.total_token_count as u64;
-
-            usage
+            super::normalized_token_usage(
+                self.prompt_token_count,
+                self.candidates_token_count,
+                self.total_token_count,
+                self.cached_content_token_count,
+                self.thoughts_token_count,
+                self.tool_use_prompt_token_count,
+            )
         }
     }
 
@@ -2215,6 +2243,64 @@ mod tests {
             serde_json::from_str(r#"{"promptTokenCount": 12}"#).expect("should deserialize");
         assert_eq!(usage.total_token_count, 0);
         assert_eq!(usage.prompt_token_count, 12);
+        let usage = usage.token_usage();
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_usage_metadata_normalizes_token_components() {
+        let cases = [
+            (
+                json!({
+                    "promptTokenCount": 20,
+                    "toolUsePromptTokenCount": 5,
+                    "candidatesTokenCount": 30,
+                    "thoughtsTokenCount": 10,
+                    "totalTokenCount": 65
+                }),
+                25,
+                40,
+                10,
+                65,
+            ),
+            (
+                json!({
+                    "promptTokenCount": 0,
+                    "candidatesTokenCount": 0,
+                    "thoughtsTokenCount": 0,
+                    "totalTokenCount": 0
+                }),
+                0,
+                0,
+                0,
+                0,
+            ),
+            (
+                json!({
+                    "promptTokenCount": 20,
+                    "toolUsePromptTokenCount": null,
+                    "candidatesTokenCount": null,
+                    "thoughtsTokenCount": null,
+                    "totalTokenCount": 20
+                }),
+                20,
+                0,
+                0,
+                20,
+            ),
+        ];
+
+        for (payload, expected_input, expected_output, expected_reasoning, expected_total) in cases
+        {
+            let usage: UsageMetadata = serde_json::from_value(payload).unwrap();
+            let usage = usage.token_usage();
+
+            assert_eq!(usage.input_tokens, expected_input);
+            assert_eq!(usage.output_tokens, expected_output);
+            assert_eq!(usage.reasoning_tokens, expected_reasoning);
+            assert_eq!(usage.total_tokens, expected_total);
+        }
     }
 
     #[test]
@@ -2676,7 +2762,7 @@ mod tests {
                 prompt_token_count: 40,
                 cached_content_token_count: Some(20),
                 candidates_token_count: Some(30),
-                total_token_count: 100,
+                total_token_count: 92,
                 thoughts_token_count: Some(10),
                 prompt_tokens_details: None,
                 cache_tokens_details: None,
@@ -2691,12 +2777,12 @@ mod tests {
         let converted: crate::completion::CompletionResponse<GenerateContentResponse> =
             response.try_into().expect("convert response");
 
-        assert_eq!(converted.usage.input_tokens, 40);
+        assert_eq!(converted.usage.input_tokens, 52);
         assert_eq!(converted.usage.cached_input_tokens, 20);
-        assert_eq!(converted.usage.output_tokens, 30);
+        assert_eq!(converted.usage.output_tokens, 40);
         assert_eq!(converted.usage.reasoning_tokens, 10);
         assert_eq!(converted.usage.tool_use_prompt_tokens, 12);
-        assert_eq!(converted.usage.total_tokens, 100);
+        assert_eq!(converted.usage.total_tokens, 92);
     }
 
     #[test]
