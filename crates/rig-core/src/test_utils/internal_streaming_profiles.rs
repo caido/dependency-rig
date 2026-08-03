@@ -10,6 +10,15 @@ use crate::{
 
 use super::MockResponse;
 
+fn tool_calls_finish_reason() -> CompatibleFinishReason {
+    CompatibleFinishReason::Terminal(
+        crate::completion::CompletionTerminalMetadata::new(
+            crate::completion::CompletionFinishReason::ToolCalls,
+        )
+        .with_raw_reason("tool_calls"),
+    )
+}
+
 fn test_chunk(choice: CompatibleChoice<()>) -> CompatibleChunk<MockResponse, ()> {
     CompatibleChunk {
         response_id: None,
@@ -124,10 +133,7 @@ impl CompatibleStreamProfile for DistinctToolCallEvictionProfile {
                 CompatibleFinishReason::Other,
                 vec![tool_call_chunk(0, None, None, Some("{\"query\":\"two\"}"))],
             )),
-            "finish" => Some(tool_call_choice(
-                CompatibleFinishReason::ToolCalls,
-                Vec::new(),
-            )),
+            "finish" => Some(tool_call_choice(tool_calls_finish_reason(), Vec::new())),
             _ => None,
         };
 
@@ -166,10 +172,7 @@ impl CompatibleStreamProfile for FinishReasonCleanupProfile {
                     Some("{\"x\":"),
                 )],
             )),
-            "finish" => Some(tool_call_choice(
-                CompatibleFinishReason::ToolCalls,
-                Vec::new(),
-            )),
+            "finish" => Some(tool_call_choice(tool_calls_finish_reason(), Vec::new())),
             _ => None,
         };
 

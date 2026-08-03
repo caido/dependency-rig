@@ -578,15 +578,16 @@ fn reasoning_parts(reasoning: &Reasoning) -> Vec<TelemetryPart> {
     reasoning
         .content
         .iter()
-        .map(|content| {
-            let content = match content {
+        .filter_map(|content| {
+            let content = match content.provider_content()? {
                 ReasoningContent::Text { text, .. } | ReasoningContent::Summary(text) => text,
                 ReasoningContent::Encrypted(content) => content,
                 ReasoningContent::Redacted { data } => data,
+                ReasoningContent::ProviderData { .. } => return None,
             };
-            TelemetryPart::Reasoning {
+            Some(TelemetryPart::Reasoning {
                 content: content.clone(),
-            }
+            })
         })
         .collect()
 }

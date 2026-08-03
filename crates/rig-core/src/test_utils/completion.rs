@@ -9,10 +9,10 @@ use crate::{
     OneOrMany,
     completion::{
         AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
-        Usage,
+        CompletionTerminalMetadata, Usage,
     },
     message::{ToolCall, ToolFunction},
-    streaming::{StreamingCompletionResponse, StreamingResult},
+    streaming::{InternalStreamingResult, StreamingCompletionResponse},
 };
 
 use super::streaming::{MockResponse, MockStreamEvent};
@@ -56,6 +56,7 @@ struct MockTurnResponse {
     choice: OneOrMany<AssistantContent>,
     usage: Usage,
     message_id: Option<String>,
+    terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 
 impl MockTurn {
@@ -97,6 +98,7 @@ impl MockTurn {
                 choice: OneOrMany::one(content),
                 usage: Usage::new(),
                 message_id: None,
+                terminal_metadata: None,
             }),
         }
     }
@@ -110,6 +112,7 @@ impl MockTurn {
                 choice: OneOrMany::many(content)?,
                 usage: Usage::new(),
                 message_id: None,
+                terminal_metadata: None,
             }),
         })
     }
@@ -144,12 +147,25 @@ impl MockTurn {
         self
     }
 
+    /// Set terminal metadata for this turn.
+    pub fn with_terminal_metadata(mut self, metadata: CompletionTerminalMetadata) -> Self {
+        if let Ok(response) = &mut self.response {
+            response.terminal_metadata = Some(metadata);
+        }
+        self
+    }
+
     fn into_completion_response(self) -> Result<CompletionResponse<MockResponse>, CompletionError> {
         let response = self.response.map_err(MockError::into_completion_error)?;
         Ok(CompletionResponse {
             choice: response.choice,
             usage: response.usage,
-            raw_response: MockResponse::with_usage(response.usage),
+            raw_response: match response.terminal_metadata {
+                Some(metadata) => {
+                    MockResponse::with_usage(response.usage).with_terminal_metadata(metadata)
+                }
+                None => MockResponse::with_usage(response.usage),
+            },
             message_id: response.message_id,
         })
     }
@@ -292,11 +308,11 @@ impl CompletionModel for MockCompletionModel {
 
         let stream = async_stream::stream! {
             for event in events {
-                yield event.into_raw_choice();
+                yield event.into_internal_choice();
             }
         };
-        let stream: StreamingResult<Self::StreamingResponse> = Box::pin(stream);
-        Ok(StreamingCompletionResponse::stream(stream))
+        let stream: InternalStreamingResult<Self::StreamingResponse> = Box::pin(stream);
+        Ok(StreamingCompletionResponse::stream_internal(stream))
     }
 }
 
@@ -304,8 +320,11 @@ impl CompletionModel for MockCompletionModel {
 mod tests {
     use super::*;
     use crate::{
-        completion::GetTokenUsage,
-        message::Message,
+        completion::{
+            CompletionFinishReason, CompletionTerminalMetadata, GetCompletionMetadata,
+            GetTokenUsage,
+        },
+        message::{Message, ReasoningContent},
         streaming::{StreamedAssistantContent, ToolCallDeltaContent},
     };
     use futures::StreamExt;
@@ -357,6 +376,22 @@ mod tests {
 
         assert_eq!(model.request_count(), 2);
         assert_eq!(model.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn completion_exposes_scripted_terminal_metadata() {
+        let metadata = CompletionTerminalMetadata::new(CompletionFinishReason::Stop)
+            .with_raw_reason("mock_stop");
+        let model = MockCompletionModel::new([
+            MockTurn::text("done").with_terminal_metadata(metadata.clone())
+        ]);
+
+        let response = model
+            .completion(request("hello"))
+            .await
+            .expect("scripted completion should succeed");
+
+        assert_eq!(response.terminal_metadata(), Some(metadata));
     }
 
     #[tokio::test]
@@ -433,6 +468,62 @@ mod tests {
         assert!(saw_final);
         assert_eq!(stream.message_id.as_deref(), Some("msg_stream"));
         assert_eq!(model.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_exposes_scripted_usage_and_terminal_metadata() {
+        let metadata = CompletionTerminalMetadata::new(CompletionFinishReason::Length)
+            .with_raw_reason("mock_length");
+        let usage = Usage {
+            input_tokens: 3,
+            output_tokens: 5,
+            total_tokens: 8,
+            ..Usage::new()
+        };
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("partial"),
+            MockStreamEvent::final_response_with_metadata(usage, metadata.clone()),
+        ]]);
+        let mut stream = model
+            .stream(request("stream"))
+            .await
+            .expect("stream should be created");
+
+        while stream.next().await.is_some() {}
+
+        assert_eq!(stream.usage(), usage);
+        assert_eq!(stream.terminal_metadata(), Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_scripted_reasoning_replay_metadata() {
+        let additional_params = serde_json::json!({
+            "encrypted_content": "opaque"
+        });
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::reasoning_with_additional_params(
+                ReasoningContent::Encrypted("ciphertext".to_string()),
+                additional_params.clone(),
+            ),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let mut stream = model
+            .stream(request("stream"))
+            .await
+            .expect("stream should be created");
+
+        while stream.next().await.is_some() {}
+
+        let reasoning = stream.choice.iter().find_map(|content| match content {
+            AssistantContent::Reasoning(reasoning) => Some(reasoning),
+            _ => None,
+        });
+        let reasoning = reasoning.expect("reasoning should be aggregated");
+        assert_eq!(reasoning.additional_params, Some(additional_params));
+        assert_eq!(
+            reasoning.content,
+            vec![ReasoningContent::Encrypted("ciphertext".to_string())]
+        );
     }
 
     #[tokio::test]

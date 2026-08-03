@@ -6,7 +6,10 @@
 //! events without depending on a runtime.
 
 use crate::OneOrMany;
-use crate::completion::{CompletionError, CompletionResponse, GetTokenUsage, Usage};
+use crate::completion::{
+    CompletionError, CompletionResponse, CompletionTerminalMetadata, GetCompletionMetadata,
+    GetTokenUsage, Usage,
+};
 use crate::message::{
     AssistantContent, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction, ToolResult,
 };
@@ -228,6 +231,65 @@ pub type StreamingResult<R> =
 pub type StreamingResult<R> =
     Pin<Box<dyn Stream<Item = Result<RawStreamingChoice<R>, CompletionError>>>>;
 
+pub(crate) enum InternalStreamingChoice<R>
+where
+    R: Clone,
+{
+    Raw(RawStreamingChoice<R>),
+    Final {
+        response: R,
+        sidecar: StreamingFinalSidecar,
+    },
+}
+
+#[derive(Default)]
+pub(crate) struct StreamingFinalSidecar {
+    pub(crate) terminal_metadata: Option<CompletionTerminalMetadata>,
+    pub(crate) normalized_usage: Option<Usage>,
+}
+
+impl<R> From<RawStreamingChoice<R>> for InternalStreamingChoice<R>
+where
+    R: Clone,
+{
+    fn from(choice: RawStreamingChoice<R>) -> Self {
+        Self::Raw(choice)
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) type InternalStreamingResult<R> =
+    Pin<Box<dyn Stream<Item = Result<InternalStreamingChoice<R>, CompletionError>> + Send>>;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) type InternalStreamingResult<R> =
+    Pin<Box<dyn Stream<Item = Result<InternalStreamingChoice<R>, CompletionError>>>>;
+
+pub(crate) enum StreamingInput<R>
+where
+    R: Clone,
+{
+    Public(StreamingResult<R>),
+    Internal(InternalStreamingResult<R>),
+}
+
+impl<R> Stream for StreamingInput<R>
+where
+    R: Clone,
+{
+    type Item = Result<InternalStreamingChoice<R>, CompletionError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Public(stream) => stream
+                .as_mut()
+                .poll_next(cx)
+                .map(|item| item.map(|item| item.map(InternalStreamingChoice::Raw))),
+            Self::Internal(stream) => stream.as_mut().poll_next(cx),
+        }
+    }
+}
+
 /// The response from a streaming completion request;
 /// message and response are populated at the end of the
 /// `inner` stream.
@@ -235,7 +297,7 @@ pub struct StreamingCompletionResponse<R>
 where
     R: Clone + Unpin + GetTokenUsage,
 {
-    pub(crate) inner: Abortable<StreamingResult<R>>,
+    pub(crate) inner: Abortable<StreamingInput<R>>,
     pub(crate) abort_handle: AbortHandle,
     pub(crate) pause_control: PauseControl,
     assistant_items: Vec<AssistantContent>,
@@ -250,6 +312,8 @@ where
     pub final_response_yielded: AtomicBool,
     /// Provider-assigned message ID (e.g. OpenAI Responses API `msg_` ID).
     pub message_id: Option<String>,
+    terminal_metadata: Option<CompletionTerminalMetadata>,
+    usage_override: Option<Usage>,
 }
 
 impl<R> StreamingCompletionResponse<R>
@@ -258,6 +322,16 @@ where
 {
     /// Wrap a provider stream and initialize aggregation state.
     pub fn stream(inner: StreamingResult<R>) -> StreamingCompletionResponse<R> {
+        Self::from_input(StreamingInput::Public(inner))
+    }
+
+    pub(crate) fn stream_internal(
+        inner: InternalStreamingResult<R>,
+    ) -> StreamingCompletionResponse<R> {
+        Self::from_input(StreamingInput::Internal(inner))
+    }
+
+    fn from_input(inner: StreamingInput<R>) -> StreamingCompletionResponse<R> {
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
         let abortable_stream = Abortable::new(inner, abort_registration);
         let pause_control = PauseControl::new();
@@ -272,6 +346,8 @@ where
             response: None,
             final_response_yielded: AtomicBool::new(false),
             message_id: None,
+            terminal_metadata: None,
+            usage_override: None,
         }
     }
 
@@ -280,8 +356,9 @@ where
     pub fn cancel(&mut self) {
         self.abort_handle.abort();
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
-        let empty: StreamingResult<R> = Box::pin(futures::stream::poll_fn(|_| Poll::Ready(None)));
-        self.inner = Abortable::new(empty, abort_registration);
+        let empty: InternalStreamingResult<R> =
+            Box::pin(futures::stream::poll_fn(|_| Poll::Ready(None)));
+        self.inner = Abortable::new(StreamingInput::Internal(empty), abort_registration);
         self.abort_handle = abort_handle;
     }
 
@@ -307,7 +384,8 @@ where
     /// usage — this returns [`Usage::new`], the zero-valued sentinel for missing
     /// usage metrics.
     pub fn usage(&self) -> Usage {
-        self.response.token_usage()
+        self.usage_override
+            .unwrap_or_else(|| self.response.token_usage())
     }
 
     fn append_text_chunk(&mut self, text: &str) {
@@ -373,6 +451,7 @@ where
                     text: text.to_string(),
                     signature: None,
                 }],
+                additional_params: None,
             }));
         self.reasoning_item_index = Some(self.assistant_items.len() - 1);
     }
@@ -414,10 +493,21 @@ where
             // Derive usage from the final response. `Option<R>: GetTokenUsage`
             // yields the provider's usage when present and the zero sentinel
             // (`Usage::new`) when the stream produced no final response.
-            usage: value.response.token_usage(),
+            usage: value
+                .usage_override
+                .unwrap_or_else(|| value.response.token_usage()),
             raw_response: value.response,
             message_id: value.message_id,
         }
+    }
+}
+
+impl<R> GetCompletionMetadata for StreamingCompletionResponse<R>
+where
+    R: Clone + Unpin + GetTokenUsage,
+{
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.terminal_metadata.clone()
     }
 }
 
@@ -459,7 +549,23 @@ where
                 }
                 Poll::Ready(Some(Err(err)))
             }
-            Poll::Ready(Some(Ok(choice))) => match choice {
+            Poll::Ready(Some(Ok(InternalStreamingChoice::Final { response, sidecar }))) => {
+                if stream
+                    .final_response_yielded
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    stream.poll_next_unpin(cx)
+                } else {
+                    stream.terminal_metadata = sidecar.terminal_metadata;
+                    stream.usage_override = sidecar.normalized_usage;
+                    stream.response = Some(response.clone());
+                    stream
+                        .final_response_yielded
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    Poll::Ready(Some(Ok(StreamedAssistantContent::final_response(response))))
+                }
+            }
+            Poll::Ready(Some(Ok(InternalStreamingChoice::Raw(choice)))) => match choice {
                 RawStreamingChoice::Message(text) => {
                     stream.reasoning_item_index = None;
                     stream.append_text_chunk(&text);
@@ -487,9 +593,20 @@ where
                     content,
                 }))),
                 RawStreamingChoice::Reasoning { id, content } => {
+                    let (content, additional_params) = match content {
+                        ReasoningContent::ProviderData {
+                            content,
+                            additional_params,
+                        } => (
+                            content.map(|content| *content).into_iter().collect(),
+                            Some(additional_params),
+                        ),
+                        content => (vec![content], None),
+                    };
                     let reasoning = Reasoning {
                         id,
-                        content: vec![content],
+                        content,
+                        additional_params,
                     };
                     stream.text_item_index = None;
                     // Full reasoning block supersedes any delta accumulation
@@ -811,7 +928,8 @@ mod tests {
             item,
             AssistantContent::Reasoning(Reasoning {
                 id: Some(id),
-                content
+                content,
+                ..
             }) if id == "rs_1"
                 && matches!(
                     content.first(),

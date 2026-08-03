@@ -85,6 +85,44 @@ pub enum ReasoningContent {
     Redacted { data: String },
     /// Provider-generated reasoning summary text.
     Summary(String),
+    /// Provider-specific metadata attached to an optional reasoning block.
+    ///
+    /// Streaming aggregation unwraps this carrier before exposing or storing
+    /// the completed [`Reasoning`] item.
+    ProviderData {
+        content: Option<Box<ReasoningContent>>,
+        additional_params: serde_json::Value,
+    },
+}
+
+impl ReasoningContent {
+    pub(crate) fn provider_content(&self) -> Option<&Self> {
+        let mut content = self;
+        loop {
+            match content {
+                Self::ProviderData {
+                    content: Some(inner),
+                    ..
+                } => content = inner,
+                Self::ProviderData { content: None, .. } => return None,
+                content => return Some(content),
+            }
+        }
+    }
+
+    pub(crate) fn into_provider_content(self) -> Option<Self> {
+        let mut content = self;
+        loop {
+            match content {
+                Self::ProviderData {
+                    content: Some(inner),
+                    ..
+                } => content = *inner,
+                Self::ProviderData { content: None, .. } => return None,
+                content => return Some(content),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -95,6 +133,9 @@ pub struct Reasoning {
     pub id: Option<String>,
     /// Ordered reasoning content blocks.
     pub content: Vec<ReasoningContent>,
+    /// Provider-specific metadata required to replay the reasoning item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_params: Option<serde_json::Value>,
 }
 
 impl Reasoning {
@@ -111,6 +152,7 @@ impl Reasoning {
                 text: input.to_string(),
                 signature,
             }],
+            additional_params: None,
         }
     }
 
@@ -137,6 +179,7 @@ impl Reasoning {
                     signature: None,
                 })
                 .collect(),
+            additional_params: None,
         }
     }
 
@@ -145,6 +188,7 @@ impl Reasoning {
         Self {
             id: None,
             content: vec![ReasoningContent::Redacted { data: data.into() }],
+            additional_params: None,
         }
     }
 
@@ -153,6 +197,7 @@ impl Reasoning {
         Self {
             id: None,
             content: vec![ReasoningContent::Encrypted(data.into())],
+            additional_params: None,
         }
     }
 
@@ -161,18 +206,26 @@ impl Reasoning {
         Self {
             id: None,
             content: input.into_iter().map(ReasoningContent::Summary).collect(),
+            additional_params: None,
         }
+    }
+
+    /// Attach provider-specific metadata required to replay this reasoning item.
+    pub fn with_additional_params(mut self, additional_params: serde_json::Value) -> Self {
+        self.additional_params = Some(additional_params);
+        self
     }
 
     /// Render reasoning as displayable text by joining text-like blocks with newlines.
     pub fn display_text(&self) -> String {
         self.content
             .iter()
-            .filter_map(|content| match content {
+            .filter_map(|content| match content.provider_content()? {
                 ReasoningContent::Text { text, .. } => Some(text.as_str()),
                 ReasoningContent::Summary(summary) => Some(summary.as_str()),
                 ReasoningContent::Redacted { data } => Some(data.as_str()),
                 ReasoningContent::Encrypted(_) => None,
+                ReasoningContent::ProviderData { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -180,29 +233,38 @@ impl Reasoning {
 
     /// Return the first text reasoning block, if present.
     pub fn first_text(&self) -> Option<&str> {
-        self.content.iter().find_map(|content| match content {
-            ReasoningContent::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
+        self.content
+            .iter()
+            .filter_map(ReasoningContent::provider_content)
+            .find_map(|content| match content {
+                ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
     }
 
     /// Return the first signature from text reasoning, if present.
     pub fn first_signature(&self) -> Option<&str> {
-        self.content.iter().find_map(|content| match content {
-            ReasoningContent::Text {
-                signature: Some(signature),
-                ..
-            } => Some(signature.as_str()),
-            _ => None,
-        })
+        self.content
+            .iter()
+            .filter_map(ReasoningContent::provider_content)
+            .find_map(|content| match content {
+                ReasoningContent::Text {
+                    signature: Some(signature),
+                    ..
+                } => Some(signature.as_str()),
+                _ => None,
+            })
     }
 
     /// Return the first encrypted reasoning payload, if present.
     pub fn encrypted_content(&self) -> Option<&str> {
-        self.content.iter().find_map(|content| match content {
-            ReasoningContent::Encrypted(data) => Some(data.as_str()),
-            _ => None,
-        })
+        self.content
+            .iter()
+            .filter_map(ReasoningContent::provider_content)
+            .find_map(|content| match content {
+                ReasoningContent::Encrypted(data) => Some(data.as_str()),
+                _ => None,
+            })
     }
 }
 

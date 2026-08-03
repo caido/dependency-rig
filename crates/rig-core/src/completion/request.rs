@@ -223,6 +223,61 @@ pub struct CompletionResponse<T> {
     pub message_id: Option<String>,
 }
 
+/// Provider-independent reason a successful completion ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CompletionFinishReason {
+    /// The model completed normally or matched a configured stop sequence.
+    Stop,
+    /// The provider stopped at a token, output, or context limit.
+    Length,
+    /// The model completed the turn by emitting one or more tool calls.
+    ToolCalls,
+    /// The provider stopped or blocked output for safety or content filtering.
+    ContentFilter,
+    /// The provider supplied a terminal reason Rig does not recognize.
+    Unknown,
+}
+
+/// Canonical metadata describing why a successful completion ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompletionTerminalMetadata {
+    /// Normalized provider-independent terminal reason.
+    pub reason: CompletionFinishReason,
+    /// Exact provider reason string, when one was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_reason: Option<String>,
+}
+
+impl CompletionTerminalMetadata {
+    /// Create terminal metadata without a provider-specific reason string.
+    pub fn new(reason: CompletionFinishReason) -> Self {
+        Self {
+            reason,
+            raw_reason: None,
+        }
+    }
+
+    /// Attach the exact reason string supplied by the provider.
+    pub fn with_raw_reason(mut self, raw_reason: impl Into<String>) -> Self {
+        self.raw_reason = Some(raw_reason.into());
+        self
+    }
+
+    /// Return the provider-independent terminal category.
+    pub fn reason(&self) -> CompletionFinishReason {
+        self.reason
+    }
+
+    /// Return the exact provider reason string, when available.
+    pub fn raw_reason(&self) -> Option<&str> {
+        self.raw_reason.as_deref()
+    }
+}
+
 /// A trait for grabbing the token usage of a completion response.
 ///
 /// Primarily designed for streamed completion responses in streamed multi-turn, as otherwise it would be impossible to do.
@@ -249,6 +304,38 @@ where
         } else {
             crate::completion::Usage::new()
         }
+    }
+}
+
+/// A trait for reading provider-independent metadata from a completion response.
+///
+/// This is separate from [`GetTokenUsage`] because terminal state describes the
+/// completion result rather than its usage accounting.
+pub trait GetCompletionMetadata {
+    /// Returns normalized terminal metadata when the provider supplied it.
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        None
+    }
+}
+
+impl GetCompletionMetadata for () {}
+
+impl<T> GetCompletionMetadata for Option<T>
+where
+    T: GetCompletionMetadata,
+{
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.as_ref()
+            .and_then(GetCompletionMetadata::terminal_metadata)
+    }
+}
+
+impl<T> GetCompletionMetadata for CompletionResponse<T>
+where
+    T: GetCompletionMetadata,
+{
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.raw_response.terminal_metadata()
     }
 }
 

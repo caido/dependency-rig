@@ -1,9 +1,14 @@
 //! Streaming helpers for [`MockCompletionModel`](super::MockCompletionModel).
 
 use crate::{
-    completion::{CompletionError, GetTokenUsage, Usage},
+    completion::{
+        CompletionError, CompletionTerminalMetadata, GetCompletionMetadata, GetTokenUsage, Usage,
+    },
     message::ReasoningContent,
-    streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent},
+    streaming::{
+        InternalStreamingChoice, RawStreamingChoice, RawStreamingToolCall, StreamingFinalSidecar,
+        ToolCallDeltaContent,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +16,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct MockResponse {
     usage: Usage,
+    terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 
 impl MockResponse {
@@ -19,12 +25,16 @@ impl MockResponse {
     pub fn new() -> Self {
         Self {
             usage: Usage::new(),
+            terminal_metadata: None,
         }
     }
 
     /// Create a mock raw response carrying token usage.
     pub fn with_usage(usage: Usage) -> Self {
-        Self { usage }
+        Self {
+            usage,
+            terminal_metadata: None,
+        }
     }
 
     /// Create a mock raw response whose usage has only `total_tokens` set.
@@ -33,11 +43,23 @@ impl MockResponse {
         usage.total_tokens = total_tokens;
         Self::with_usage(usage)
     }
+
+    /// Attach terminal metadata to this mock response.
+    pub fn with_terminal_metadata(mut self, metadata: CompletionTerminalMetadata) -> Self {
+        self.terminal_metadata = Some(metadata);
+        self
+    }
 }
 
 impl GetTokenUsage for MockResponse {
     fn token_usage(&self) -> Usage {
         self.usage
+    }
+}
+
+impl GetCompletionMetadata for MockResponse {
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.terminal_metadata.clone()
     }
 }
 
@@ -162,6 +184,20 @@ impl MockStreamEvent {
         }
     }
 
+    /// Create a complete reasoning event with provider replay metadata.
+    pub fn reasoning_with_additional_params(
+        content: ReasoningContent,
+        additional_params: serde_json::Value,
+    ) -> Self {
+        Self::Reasoning {
+            id: None,
+            content: ReasoningContent::ProviderData {
+                content: Some(Box::new(content)),
+                additional_params,
+            },
+        }
+    }
+
     /// Attach a provider-specific reasoning ID to a complete reasoning event.
     pub fn with_reasoning_id(mut self, reasoning_id: impl Into<String>) -> Self {
         if let Self::Reasoning { id, .. } = &mut self {
@@ -201,6 +237,14 @@ impl MockStreamEvent {
     /// Create a final response event whose usage has only `total_tokens` set.
     pub fn final_response_with_total_tokens(total_tokens: u64) -> Self {
         Self::FinalResponse(MockResponse::with_total_tokens(total_tokens))
+    }
+
+    /// Create a final response event with usage and terminal metadata.
+    pub fn final_response_with_metadata(
+        usage: Usage,
+        metadata: CompletionTerminalMetadata,
+    ) -> Self {
+        Self::FinalResponse(MockResponse::with_usage(usage).with_terminal_metadata(metadata))
     }
 
     /// Create a stream error event.
@@ -248,6 +292,21 @@ impl MockStreamEvent {
             Self::Unknown(value) => Ok(RawStreamingChoice::Unknown(value)),
             Self::FinalResponse(response) => Ok(RawStreamingChoice::FinalResponse(response)),
             Self::Error(error) => Err(error.into_completion_error()),
+        }
+    }
+
+    pub(crate) fn into_internal_choice(
+        self,
+    ) -> Result<InternalStreamingChoice<MockResponse>, CompletionError> {
+        match self {
+            Self::FinalResponse(response) => Ok(InternalStreamingChoice::Final {
+                sidecar: StreamingFinalSidecar {
+                    terminal_metadata: response.terminal_metadata(),
+                    normalized_usage: None,
+                },
+                response,
+            }),
+            event => event.into_raw_choice().map(InternalStreamingChoice::Raw),
         }
     }
 }
