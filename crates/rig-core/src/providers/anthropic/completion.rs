@@ -1844,7 +1844,10 @@ enum OutputFormat {
 /// Configuration for the model's output format.
 #[derive(Debug, Deserialize, Serialize)]
 struct OutputConfig {
-    format: OutputFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<serde_json::Value>,
+    #[serde(flatten)]
+    additional_params: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2240,6 +2243,60 @@ pub(super) fn resolve_top_level_cache_control(
     }
 }
 
+fn extract_output_config(
+    additional_params: &mut serde_json::Value,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, CompletionError> {
+    let Some(map) = additional_params.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(raw_output_config) = map.remove("output_config") else {
+        return Ok(None);
+    };
+
+    match raw_output_config {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(output_config) => Ok(Some(output_config)),
+        _ => Err(CompletionError::RequestError(
+            "Anthropic `additional_params.output_config` must be an object or null".into(),
+        )),
+    }
+}
+
+fn resolve_output_config(
+    output_schema: Option<schemars::Schema>,
+    additional_params: &mut serde_json::Value,
+) -> Result<Option<OutputConfig>, CompletionError> {
+    let raw_output_config = extract_output_config(additional_params)?;
+    if output_schema.is_none() && raw_output_config.is_none() {
+        return Ok(None);
+    }
+
+    let mut additional_params = raw_output_config.unwrap_or_default();
+    let format = match output_schema {
+        Some(schema) => {
+            if additional_params.contains_key("format") {
+                return Err(CompletionError::RequestError(
+                    "Anthropic `additional_params.output_config.format` conflicts with the typed \
+                     output schema"
+                        .into(),
+                ));
+            }
+
+            let mut schema_value = schema.to_value();
+            sanitize_schema(&mut schema_value);
+            Some(serde_json::to_value(OutputFormat::JsonSchema {
+                schema: schema_value,
+            })?)
+        }
+        None => additional_params.remove("format"),
+    };
+
+    Ok(Some(OutputConfig {
+        format,
+        additional_params,
+    }))
+}
+
 pub(super) fn split_system_messages_from_history(
     history: Vec<message::Message>,
     preserve_mid_conversation_system_messages: bool,
@@ -2360,6 +2417,8 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             automatic_caching_ttl,
             &mut additional_params_payload,
         )?;
+        let output_config =
+            resolve_output_config(req.output_schema.take(), &mut additional_params_payload)?;
         let mut tools = build_tool_definitions(req.tools, &mut additional_params_payload)?;
 
         // Convert system prompt to array format for cache_control support
@@ -2384,18 +2443,6 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             prompt_caching,
             top_level_cache_control.as_ref(),
         )?;
-
-        let output_config = if let Some(schema) = req.output_schema {
-            let mut schema_value = schema.to_value();
-            sanitize_schema(&mut schema_value);
-            Some(OutputConfig {
-                format: OutputFormat::JsonSchema {
-                    schema: schema_value,
-                },
-            })
-        } else {
-            None
-        };
 
         Ok(Self {
             model: model.to_string(),
@@ -3099,6 +3146,125 @@ mod tests {
             output_schema: None,
             record_telemetry_content: false,
         }
+    }
+
+    fn test_output_schema() -> schemars::Schema {
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn raw_output_config_is_preserved_as_one_nested_object() {
+        let request = completion_request_with_tools(
+            Vec::new(),
+            Some(json!({
+                "output_config": {
+                    "format": { "type": "future_format", "version": 2 },
+                    "effort": "high",
+                    "future_control": { "enabled": true }
+                },
+                "metadata": { "source": "test" }
+            })),
+        );
+
+        let request = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+            model: CLAUDE_OPUS_4_8,
+            request,
+            prompt_caching: false,
+            automatic_caching: false,
+            automatic_caching_ttl: None,
+        })
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            value["output_config"],
+            json!({
+                "format": { "type": "future_format", "version": 2 },
+                "effort": "high",
+                "future_control": { "enabled": true }
+            })
+        );
+        assert_eq!(value["metadata"]["source"], "test");
+        assert!(value.get("effort").is_none());
+        assert!(value.get("future_control").is_none());
+    }
+
+    #[test]
+    fn null_raw_output_config_is_omitted() {
+        let request = completion_request_with_tools(
+            Vec::new(),
+            Some(json!({
+                "output_config": null,
+                "metadata": { "source": "test" }
+            })),
+        );
+
+        let request = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+            model: CLAUDE_OPUS_4_8,
+            request,
+            prompt_caching: false,
+            automatic_caching: false,
+            automatic_caching_ttl: None,
+        })
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+
+        assert!(value.get("output_config").is_none());
+        assert_eq!(value["metadata"]["source"], "test");
+    }
+
+    #[test]
+    fn raw_output_config_must_be_an_object_or_null() {
+        let request =
+            completion_request_with_tools(Vec::new(), Some(json!({ "output_config": "adaptive" })));
+
+        let error = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+            model: CLAUDE_OPUS_4_8,
+            request,
+            prompt_caching: false,
+            automatic_caching: false,
+            automatic_caching_ttl: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("additional_params.output_config` must be an object or null")
+        );
+    }
+
+    #[test]
+    fn raw_and_typed_output_formats_conflict() {
+        let mut request = completion_request_with_tools(
+            Vec::new(),
+            Some(json!({
+                "output_config": {
+                    "format": { "type": "json_schema", "schema": {} },
+                    "effort": "high"
+                }
+            })),
+        );
+        request.output_schema = Some(test_output_schema());
+
+        let error = AnthropicCompletionRequest::try_from(AnthropicRequestParams {
+            model: CLAUDE_OPUS_4_8,
+            request,
+            prompt_caching: false,
+            automatic_caching: false,
+            automatic_caching_ttl: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("output_config.format` conflicts with the typed output schema")
+        );
     }
 
     fn system_has_cache_control(value: &serde_json::Value) -> bool {

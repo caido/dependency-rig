@@ -685,7 +685,12 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: Some(64),
             tool_choice: None,
-            additional_params: None,
+            additional_params: Some(json!({
+                "output_config": {
+                    "effort": "high",
+                    "future_control": { "enabled": true }
+                }
+            })),
             output_schema: Some(schema),
             record_telemetry_content: false,
         };
@@ -713,6 +718,11 @@ mod tests {
         assert!(
             streaming_body["output_config"]["format"]["schema"].is_object(),
             "streaming body must carry the structured-output schema: {streaming_body}"
+        );
+        assert_eq!(streaming_body["output_config"]["effort"], "high");
+        assert_eq!(
+            streaming_body["output_config"]["future_control"]["enabled"],
+            true
         );
 
         // Unification invariant: the streaming body is exactly the blocking body
