@@ -3,11 +3,12 @@ use crate::message::{self, DocumentMediaType, DocumentSourceKind, MimeType};
 use crate::telemetry::ProviderResponseExt;
 use crate::{
     OneOrMany,
-    completion::{self, CompletionError, CompletionRequest},
+    completion::{self, CompletionError, CompletionRequest, GetCompletionMetadata, GetTokenUsage},
     json_utils,
     providers::openai,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 // ================================================================
@@ -575,6 +576,42 @@ pub struct CompletionResponse {
     pub usage: Option<Usage>,
 }
 
+impl GetCompletionMetadata for CompletionResponse {
+    fn terminal_metadata(&self) -> Option<completion::CompletionTerminalMetadata> {
+        let choice = self.choices.first()?;
+        terminal_metadata_from_finish_reason(choice.finish_reason.as_deref()).map(|metadata| {
+            match &choice.native_finish_reason {
+                Some(native_reason) => metadata.with_raw_reason(native_reason),
+                None => metadata,
+            }
+        })
+    }
+}
+
+fn normalized_usage_from_raw(raw_usage: &serde_json::Value, usage: &Usage) -> completion::Usage {
+    let mut normalized = usage.token_usage();
+    normalized.reasoning_tokens = raw_usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    normalized
+}
+
+pub(crate) fn terminal_metadata_from_finish_reason(
+    raw_reason: Option<&str>,
+) -> Option<completion::CompletionTerminalMetadata> {
+    let raw_reason = raw_reason?;
+    let reason = match raw_reason {
+        "stop" => completion::CompletionFinishReason::Stop,
+        "length" => completion::CompletionFinishReason::Length,
+        "tool_calls" => completion::CompletionFinishReason::ToolCalls,
+        "content_filter" => completion::CompletionFinishReason::ContentFilter,
+        _ => completion::CompletionFinishReason::Unknown,
+    };
+
+    Some(completion::CompletionTerminalMetadata::new(reason).with_raw_reason(raw_reason))
+}
+
 impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionResponse> {
     type Error = CompletionError;
 
@@ -582,6 +619,13 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
         let choice = response.choices.first().ok_or_else(|| {
             CompletionError::ResponseError("Response contained no choices".to_owned())
         })?;
+        let terminal_metadata =
+            terminal_metadata_from_finish_reason(choice.finish_reason.as_deref()).map(|metadata| {
+                match &choice.native_finish_reason {
+                    Some(native_reason) => metadata.with_raw_reason(native_reason),
+                    None => metadata,
+                }
+            });
 
         let content = match &choice.message {
             Message::Assistant {
@@ -611,6 +655,15 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                         call.function.arguments.clone(),
                     )
                 }));
+
+                // Preserve the exact provider payload for replay. Parsed blocks remain available
+                // to callers, while the raw array avoids losing provider-specific fields.
+                let mut preserved_reasoning_details = Some(
+                    reasoning_details
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
 
                 let mut grouped_reasoning: HashMap<
                     Option<String>,
@@ -664,7 +717,19 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 }
 
                 if grouped_reasoning.is_empty() {
-                    if let Some(reasoning) = reasoning {
+                    let preserved_reasoning_details =
+                        preserved_reasoning_details.take().unwrap_or_default();
+                    if !preserved_reasoning_details.is_empty() {
+                        content.push(completion::AssistantContent::Reasoning(
+                            message::Reasoning {
+                                id: None,
+                                content: Vec::new(),
+                                additional_params: Some(serde_json::json!({
+                                    "reasoning_details": preserved_reasoning_details,
+                                })),
+                            },
+                        ));
+                    } else if let Some(reasoning) = reasoning {
                         content.push(completion::AssistantContent::reasoning(reasoning));
                     }
                 } else {
@@ -680,6 +745,11 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                                     .into_iter()
                                     .map(|(_, _, content)| content)
                                     .collect::<Vec<_>>(),
+                                additional_params: Some(serde_json::json!({
+                                    "reasoning_details": preserved_reasoning_details
+                                        .take()
+                                        .unwrap_or_default(),
+                                })),
                             },
                         ));
                     }
@@ -694,11 +764,24 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             )),
         }?;
 
-        let choice = OneOrMany::many(content).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
+        let allows_empty_choice = terminal_metadata.as_ref().is_some_and(|metadata| {
+            matches!(
+                metadata.reason(),
+                completion::CompletionFinishReason::Length
+                    | completion::CompletionFinishReason::ContentFilter
             )
-        })?;
+        });
+        let choice = match OneOrMany::many(content) {
+            Ok(choice) => choice,
+            Err(_) if allows_empty_choice => {
+                OneOrMany::one(completion::AssistantContent::text(String::new()))
+            }
+            Err(_) => {
+                return Err(CompletionError::ResponseError(
+                    "Response contained no message or tool call (empty)".to_owned(),
+                ));
+            }
+        };
 
         let usage = response
             .usage
@@ -1155,13 +1238,32 @@ fn assistant_contents_to_messages(
                 tool_calls.push(tool_call.into())
             }
             message::AssistantContent::Reasoning(r) => {
-                if r.content.is_empty() {
+                let exact_reasoning_details = r
+                    .additional_params
+                    .as_ref()
+                    .and_then(|params| params.get("reasoning_details"))
+                    .and_then(Value::as_array)
+                    .and_then(|details| {
+                        details
+                            .iter()
+                            .map(|detail| {
+                                serde_json::from_value::<ReasoningDetails>(detail.clone()).ok()
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    });
+
+                if let Some(exact_reasoning_details) = exact_reasoning_details {
+                    reasoning_details.extend(exact_reasoning_details);
+                } else if r.content.is_empty() {
                     let display = r.display_text();
                     if !display.is_empty() {
                         reasoning = Some(display);
                     }
                 } else {
                     for reasoning_block in &r.content {
+                        let Some(reasoning_block) = reasoning_block.provider_content() else {
+                            continue;
+                        };
                         let index = Some(reasoning_details.len());
                         match reasoning_block {
                             message::ReasoningContent::Text { text, signature } => {
@@ -1190,6 +1292,7 @@ fn assistant_contents_to_messages(
                                     data: data.clone(),
                                 });
                             }
+                            message::ReasoningContent::ProviderData { .. } => continue,
                         }
                     }
                 }
@@ -1327,6 +1430,94 @@ pub(super) fn finalize_openrouter_request_body(body: &mut serde_json::Value, pro
     }
 }
 
+fn request_body_metadata(request: &CompletionRequest) -> Option<serde_json::Value> {
+    let mut replays = Vec::new();
+
+    for message in request.chat_history.iter() {
+        let message::Message::Assistant { content, .. } = message else {
+            continue;
+        };
+
+        for content in content.iter() {
+            let message::AssistantContent::Reasoning(reasoning) = content else {
+                continue;
+            };
+            let Some(raw_details) = reasoning
+                .additional_params
+                .as_ref()
+                .and_then(|params| params.get("reasoning_details"))
+                .and_then(Value::as_array)
+                .filter(|details| !details.is_empty())
+            else {
+                continue;
+            };
+
+            let canonical_details = raw_details
+                .iter()
+                .map(|detail| {
+                    serde_json::from_value::<ReasoningDetails>(detail.clone())
+                        .and_then(serde_json::to_value)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            replays.push(serde_json::json!({
+                "canonical": canonical_details,
+                "raw": raw_details,
+            }));
+        }
+    }
+
+    (!replays.is_empty()).then_some(serde_json::Value::Array(replays))
+}
+
+fn apply_request_body_metadata(
+    body: &mut serde_json::Value,
+    metadata: Option<&serde_json::Value>,
+) -> Result<(), CompletionError> {
+    let Some(replays) = metadata.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let messages = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            CompletionError::RequestError(
+                "OpenRouter request metadata requires a messages array".into(),
+            )
+        })?;
+    let mut search_from = 0;
+
+    for replay in replays {
+        let canonical = replay.get("canonical").ok_or_else(|| {
+            CompletionError::RequestError(
+                "OpenRouter request metadata is missing canonical reasoning details".into(),
+            )
+        })?;
+        let raw = replay.get("raw").ok_or_else(|| {
+            CompletionError::RequestError(
+                "OpenRouter request metadata is missing raw reasoning details".into(),
+            )
+        })?;
+        let Some((index, message)) = messages
+            .iter_mut()
+            .enumerate()
+            .skip(search_from)
+            .find(|(_, message)| message.get("reasoning_details") == Some(canonical))
+        else {
+            return Err(CompletionError::RequestError(
+                "OpenRouter could not match reasoning details to the serialized request".into(),
+            ));
+        };
+        let message = message.as_object_mut().ok_or_else(|| {
+            CompletionError::RequestError("OpenRouter request message must be an object".into())
+        })?;
+        message.insert("reasoning_details".to_string(), raw.clone());
+        search_from = index + 1;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) fn final_request_body(
     request: &OpenrouterCompletionRequest,
@@ -1433,7 +1624,7 @@ impl TryFrom<OpenRouterRequestParams<'_>> for OpenrouterCompletionRequest {
             model,
             messages: full_history,
             temperature: req.temperature,
-            max_tokens: None,
+            max_tokens: req.max_tokens,
             tools,
             tool_choice,
             additional_params,
@@ -1484,28 +1675,102 @@ impl openai::completion::OpenAICompatibleProvider for OpenRouterExt {
         Ok(())
     }
 
-    fn decorate_streaming_tool_call(
+    fn request_body_metadata(&self, request: &CompletionRequest) -> Option<serde_json::Value> {
+        request_body_metadata(request)
+    }
+
+    fn apply_request_body_metadata(
+        &self,
+        body: &mut serde_json::Value,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<(), CompletionError> {
+        apply_request_body_metadata(body, metadata)
+    }
+
+    fn normalized_blocking_usage(
+        &self,
+        raw_response: &serde_json::Value,
+    ) -> Option<completion::Usage> {
+        let raw_usage = raw_response.get("usage")?;
+        let usage = serde_json::from_value::<Usage>(raw_usage.clone()).ok()?;
+        Some(normalized_usage_from_raw(raw_usage, &usage))
+    }
+
+    fn blocking_reasoning_metadata(
+        &self,
+        raw_response: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let details = raw_response
+            .pointer("/choices/0/message/reasoning_details")
+            .and_then(Value::as_array)
+            .filter(|details| !details.is_empty())?;
+
+        Some(serde_json::json!({ "reasoning_details": details }))
+    }
+
+    fn normalized_streaming_usage(
+        &self,
+        raw_chunk: &serde_json::Value,
+        usage: &Self::StreamingUsage,
+    ) -> Option<completion::Usage> {
+        let raw_usage = raw_chunk.get("usage")?;
+        Some(normalized_usage_from_raw(raw_usage, usage))
+    }
+
+    fn streaming_reasoning_detail(
         &self,
         detail: &serde_json::Value,
-        tool_calls: &mut std::collections::HashMap<usize, crate::streaming::RawStreamingToolCall>,
-    ) {
-        let Ok(ReasoningDetails::Encrypted { id, data, .. }) =
-            serde_json::from_value::<ReasoningDetails>(detail.clone())
-        else {
-            return;
-        };
-        let Some(id) = id else {
-            return;
-        };
-        let Some(tool_call) = tool_calls
-            .values_mut()
-            .find(|tool_call| tool_call.id.eq(&id))
-        else {
-            return;
+    ) -> Option<(
+        Option<String>,
+        message::ReasoningContent,
+        Option<serde_json::Value>,
+    )> {
+        let (id, content) = match serde_json::from_value::<ReasoningDetails>(detail.clone()).ok()? {
+            ReasoningDetails::Summary { id, summary, .. } => {
+                (id, message::ReasoningContent::Summary(summary))
+            }
+            ReasoningDetails::Encrypted { id, data, .. } => {
+                (id, message::ReasoningContent::Encrypted(data))
+            }
+            ReasoningDetails::Text {
+                id,
+                text,
+                signature,
+                ..
+            } => (
+                id,
+                message::ReasoningContent::Text {
+                    text: text.unwrap_or_default(),
+                    signature,
+                },
+            ),
         };
 
-        tool_call.signature = Some(data);
-        tool_call.additional_params = Some(detail.clone());
+        Some((
+            id,
+            content,
+            Some(serde_json::json!({
+                "reasoning_details": [detail.clone()]
+            })),
+        ))
+    }
+
+    fn legacy_streaming_reasoning_is_redundant(
+        &self,
+        legacy_reasoning: &str,
+        details: &[message::ReasoningContent],
+    ) -> bool {
+        let typed_text = details
+            .iter()
+            .filter_map(|detail| match detail {
+                message::ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                message::ReasoningContent::Summary(summary) => Some(summary.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        !typed_text.is_empty()
+            && (typed_text.contains(&legacy_reasoning) || typed_text.concat() == legacy_reasoning)
     }
 }
 
@@ -1533,8 +1798,95 @@ impl<H> openai::completion::GenericCompletionModel<OpenRouterExt, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion::GetCompletionMetadata;
     use crate::message::{AudioMediaType, ImageDetail, VideoMediaType};
     use serde_json::json;
+
+    fn replay_request_body(choice: OneOrMany<message::AssistantContent>) -> Value {
+        let request = CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::many(vec![
+                message::Message::from(choice),
+                message::Message::user("continue"),
+            ])
+            .expect("chat history should be non-empty"),
+            documents: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+        let metadata = request_body_metadata(&request);
+        let request = OpenrouterCompletionRequest::try_from(("openrouter/test-model", request))
+            .expect("request should convert");
+        let mut body = final_request_body(&request, false).expect("request should serialize");
+        apply_request_body_metadata(&mut body, metadata.as_ref())
+            .expect("reasoning metadata should replay");
+        body
+    }
+
+    #[test]
+    fn reasoning_details_keep_v041_variant_shapes() {
+        let details = [
+            ReasoningDetails::Summary {
+                id: None,
+                format: None,
+                index: None,
+                summary: "summary".to_string(),
+            },
+            ReasoningDetails::Encrypted {
+                id: None,
+                format: None,
+                index: None,
+                data: "encrypted".to_string(),
+            },
+            ReasoningDetails::Text {
+                id: None,
+                format: None,
+                index: None,
+                text: Some("text".to_string()),
+                signature: None,
+            },
+        ];
+
+        for detail in details {
+            match detail {
+                ReasoningDetails::Summary {
+                    id,
+                    format,
+                    index,
+                    summary,
+                } => assert!(
+                    id.is_none() && format.is_none() && index.is_none() && !summary.is_empty()
+                ),
+                ReasoningDetails::Encrypted {
+                    id,
+                    format,
+                    index,
+                    data,
+                } => {
+                    assert!(id.is_none() && format.is_none() && index.is_none() && !data.is_empty())
+                }
+                ReasoningDetails::Text {
+                    id,
+                    format,
+                    index,
+                    text,
+                    signature,
+                } => assert!(
+                    id.is_none()
+                        && format.is_none()
+                        && index.is_none()
+                        && text.is_some()
+                        && signature.is_none()
+                ),
+            }
+        }
+    }
 
     #[test]
     fn mixed_user_content_preserves_order_around_tool_results() {
@@ -1586,6 +1938,52 @@ mod tests {
             serde_json::to_value(openrouter_request).expect("serialization should succeed");
 
         assert_eq!(serialized["model"], "google/gemini-2.5-flash");
+    }
+
+    #[test]
+    fn openrouter_request_forwards_max_tokens() {
+        let request = CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: crate::OneOrMany::one("Hello".into()),
+            documents: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: Some(321),
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+
+        let request = OpenrouterCompletionRequest::try_from(("openai/gpt-4o-mini", request))
+            .expect("request conversion should succeed");
+        let serialized = serde_json::to_value(request).expect("serialization should succeed");
+
+        assert_eq!(serialized["max_tokens"], 321);
+    }
+
+    #[test]
+    fn openrouter_request_serializes_parallel_tool_calls() {
+        let request = CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: crate::OneOrMany::one("Hello".into()),
+            documents: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: Some(serde_json::json!({ "parallel_tool_calls": true })),
+            output_schema: None,
+            record_telemetry_content: false,
+        };
+
+        let request = OpenrouterCompletionRequest::try_from(("openai/gpt-4o-mini", request))
+            .expect("request conversion should succeed");
+        let serialized = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(serialized["parallel_tool_calls"], true);
     }
 
     #[test]
@@ -1818,6 +2216,15 @@ mod tests {
         assert_eq!(response.model, "google/gemini-2.5-flash");
         assert_eq!(response.choices.len(), 1);
         assert_eq!(response.choices[0].finish_reason, Some("stop".to_string()));
+        let converted = completion::CompletionResponse::try_from(response).unwrap();
+        let terminal_metadata = converted
+            .terminal_metadata()
+            .expect("finish reason should produce terminal metadata");
+        assert_eq!(
+            terminal_metadata.reason(),
+            completion::CompletionFinishReason::Stop
+        );
+        assert_eq!(terminal_metadata.raw_reason(), Some("STOP"));
     }
 
     #[test]
@@ -1883,9 +2290,18 @@ mod tests {
                 "prompt_tokens_details": {
                     "cached_tokens": 400,
                     "cache_write_tokens": 50
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": 7
                 }
             }
         });
+
+        let normalized_usage = <OpenRouterExt as openai::completion::OpenAICompatibleProvider>::normalized_blocking_usage(
+            &OpenRouterExt,
+            &json,
+        )
+        .expect("raw usage should normalize");
 
         let response: CompletionResponse = serde_json::from_value(json).unwrap();
         let converted: completion::CompletionResponse<CompletionResponse> =
@@ -1895,6 +2311,9 @@ mod tests {
         assert_eq!(converted.usage.output_tokens, 10);
         assert_eq!(converted.usage.cached_input_tokens, 400);
         assert_eq!(converted.usage.cache_creation_input_tokens, 50);
+        assert_eq!(normalized_usage.cached_input_tokens, 400);
+        assert_eq!(normalized_usage.cache_creation_input_tokens, 50);
+        assert_eq!(normalized_usage.reasoning_tokens, 7);
     }
 
     #[test]
@@ -1925,6 +2344,87 @@ mod tests {
 
         assert_eq!(converted.usage.cached_input_tokens, 0);
         assert_eq!(converted.usage.cache_creation_input_tokens, 0);
+        assert_eq!(converted.usage.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn empty_length_and_content_filter_responses_remain_successful() {
+        for finish_reason in ["length", "content_filter"] {
+            let response: CompletionResponse = serde_json::from_value(json!({
+                "id": "gen-empty",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "openai/gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": finish_reason,
+                    "message": { "role": "assistant", "content": [] }
+                }],
+                "usage": null
+            }))
+            .expect("response should deserialize");
+
+            let converted = completion::CompletionResponse::try_from(response)
+                .expect("terminal empty response should remain successful");
+
+            assert!(matches!(
+                converted.choice.first(),
+                completion::AssistantContent::Text(text) if text.text.is_empty()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn populated_error_with_choices_is_rejected() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::openrouter::Client;
+        use crate::test_utils::RecordingHttpClient;
+
+        for body in [
+            json!({
+                "id": "gen-top-error",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "openai/gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": "partial" }
+                }],
+                "error": { "code": 502, "message": "upstream failed" }
+            }),
+            json!({
+                "id": "gen-choice-error",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "openai/gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "error",
+                    "message": { "role": "assistant", "content": "partial" },
+                    "error": { "code": 502, "message": "upstream failed" }
+                }]
+            }),
+        ] {
+            let body = body.to_string();
+            let client = Client::builder()
+                .http_client(RecordingHttpClient::new(body.clone()))
+                .api_key("test-key")
+                .build()
+                .expect("client should build");
+            let model = client.completion_model("openai/gpt-4o");
+            let request = model.completion_request("hello").build();
+
+            let error = model
+                .completion(request)
+                .await
+                .expect_err("provider error envelope must fail");
+
+            assert!(matches!(error, CompletionError::ProviderResponse(_)));
+            assert_eq!(error.provider_response_status(), Some(http::StatusCode::OK));
+            assert_eq!(error.provider_response_body(), Some(body.as_str()));
+        }
     }
 
     #[test]
@@ -2852,15 +3352,183 @@ mod tests {
 
         assert!(items.iter().any(|item| matches!(
             item,
-            completion::AssistantContent::Reasoning(message::Reasoning { id: Some(id), content })
+            completion::AssistantContent::Reasoning(message::Reasoning { id: Some(id), content, .. })
                 if id == "rs_1" && content.len() == 3
         )));
+    }
+
+    #[tokio::test]
+    async fn completion_response_replays_provider_reasoning_details() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::openrouter::Client;
+        use crate::test_utils::RecordingHttpClient;
+
+        let detail = json!({
+            "type": "reasoning.text",
+            "id": "rs_exact",
+            "format": "openai-responses-v1",
+            "index": 0,
+            "text": "private reasoning",
+            "signature": "sig_exact",
+            "provider_extension": { "opaque": true }
+        });
+        let response_body = json!({
+            "id": "resp_exact",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "openrouter/test-model",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_details": [detail.clone()]
+                }
+            }]
+        })
+        .to_string();
+        let http_client = RecordingHttpClient::new(response_body);
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(http_client.clone())
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("openrouter/test-model");
+        let first = model
+            .completion(model.completion_request("hello").build())
+            .await
+            .expect("response should convert");
+        let history = message::Message::Assistant {
+            id: first.message_id.clone(),
+            content: first.choice.clone(),
+        };
+
+        model
+            .completion(
+                model
+                    .completion_request("continue")
+                    .message(history)
+                    .build(),
+            )
+            .await
+            .expect("replay request should succeed");
+
+        let requests = http_client.requests();
+        let replay: Value = serde_json::from_slice(&requests[1].body)
+            .expect("replay request should serialize as JSON");
+        let replay_details = replay["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find_map(|message| message.get("reasoning_details"))
+            })
+            .expect("replay request should contain reasoning details");
+
+        assert_eq!(replay_details, &json!([detail]));
+    }
+
+    #[test]
+    fn streaming_reasoning_detail_replays_provider_payload() {
+        let detail = json!({
+            "type": "reasoning.summary",
+            "id": "rs_stream",
+            "format": "openai-responses-v1",
+            "index": 0,
+            "summary": "summary",
+            "provider_extension": "opaque"
+        });
+        let (id, content, additional_params) =
+            <OpenRouterExt as openai::completion::OpenAICompatibleProvider>::streaming_reasoning_detail(
+                &OpenRouterExt,
+                &detail,
+            )
+            .expect("streaming detail should convert");
+        let reasoning = message::Reasoning {
+            id,
+            content: vec![content],
+            additional_params,
+        };
+        let replay = replay_request_body(OneOrMany::one(message::AssistantContent::Reasoning(
+            reasoning,
+        )));
+        let replay = replay["messages"]
+            .as_array()
+            .and_then(|messages| messages.first())
+            .expect("replay should contain an assistant message");
+
+        assert_eq!(replay["reasoning_details"], json!([detail]));
+    }
+
+    #[tokio::test]
+    async fn streaming_encrypted_reasoning_replays_once_with_tool_call() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_data_lines;
+        use crate::providers::openrouter::Client;
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        let detail = json!({
+            "type": "reasoning.encrypted",
+            "id": "call_1",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+            "data": "encrypted_reasoning",
+            "provider_extension": "opaque"
+        });
+        let chunk = json!({
+            "id": "gen-stream-reasoning",
+            "model": "anthropic/claude-sonnet",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": null,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "lookup", "arguments": "{}" }
+                    }],
+                    "reasoning_details": [detail.clone()]
+                },
+                "finish_reason": "tool_calls",
+                "native_finish_reason": "tool_use"
+            }],
+            "usage": null
+        });
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_data_lines([chunk.to_string(), "[DONE]".to_string()]),
+            })
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("anthropic/claude-sonnet");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        while let Some(item) = stream.next().await {
+            item.expect("stream item should succeed");
+        }
+
+        let response: completion::CompletionResponse<_> = stream.into();
+        let replay = replay_request_body(response.choice);
+        let replay = replay["messages"]
+            .as_array()
+            .and_then(|messages| messages.first())
+            .expect("replay should contain an assistant message");
+
+        assert_eq!(replay["reasoning_details"], json!([detail]));
     }
 
     #[test]
     fn test_assistant_reasoning_emits_openrouter_reasoning_details() {
         let reasoning = message::Reasoning {
             id: Some("rs_2".to_string()),
+            additional_params: None,
             content: vec![
                 message::ReasoningContent::Text {
                     text: "step".to_string(),
@@ -2974,6 +3642,7 @@ mod tests {
     fn test_assistant_redacted_reasoning_emits_encrypted_detail_not_text() {
         let reasoning = message::Reasoning {
             id: Some("rs_redacted".to_string()),
+            additional_params: None,
             content: vec![message::ReasoningContent::Redacted {
                 data: "opaque-redacted-data".to_string(),
             }],
