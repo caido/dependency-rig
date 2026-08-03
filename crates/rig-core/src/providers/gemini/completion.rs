@@ -37,7 +37,7 @@ use crate::providers::gemini::streaming::StreamingCompletionResponse;
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator};
 use crate::{
     OneOrMany,
-    completion::{self, CompletionError, CompletionRequest, GetTokenUsage},
+    completion::{self, CompletionError, CompletionRequest, GetCompletionMetadata, GetTokenUsage},
 };
 use gemini_api_types::{
     Content, FinishReason, FunctionDeclaration, GenerateContentRequest, GenerateContentResponse,
@@ -440,6 +440,49 @@ pub(crate) fn function_call_finish_reason_error(
     }
 }
 
+pub(crate) fn terminal_metadata_from_finish_reason(
+    finish_reason: Option<&FinishReason>,
+    has_tool_calls: bool,
+) -> Option<completion::CompletionTerminalMetadata> {
+    let finish_reason = finish_reason?;
+    let reason = match finish_reason {
+        FinishReason::Stop if has_tool_calls => completion::CompletionFinishReason::ToolCalls,
+        FinishReason::Stop => completion::CompletionFinishReason::Stop,
+        FinishReason::MaxTokens => completion::CompletionFinishReason::Length,
+        FinishReason::Safety
+        | FinishReason::Recitation
+        | FinishReason::Language
+        | FinishReason::Blocklist
+        | FinishReason::ProhibitedContent
+        | FinishReason::Spii => completion::CompletionFinishReason::ContentFilter,
+        FinishReason::FinishReasonUnspecified
+        | FinishReason::Other
+        | FinishReason::MalformedFunctionCall
+        | FinishReason::UnexpectedToolCall
+        | FinishReason::MissingThoughtSignature
+        | FinishReason::TooManyToolCalls
+        | FinishReason::MalformedResponse => completion::CompletionFinishReason::Unknown,
+    };
+
+    Some(
+        completion::CompletionTerminalMetadata::new(reason)
+            .with_raw_reason(finish_reason.as_raw_reason()),
+    )
+}
+
+impl GetCompletionMetadata for GenerateContentResponse {
+    fn terminal_metadata(&self) -> Option<completion::CompletionTerminalMetadata> {
+        let candidate = self.candidates.first()?;
+        let has_tool_calls = candidate.content.as_ref().is_some_and(|content| {
+            content
+                .parts
+                .iter()
+                .any(|part| matches!(&part.part, PartKind::FunctionCall(_)))
+        });
+        terminal_metadata_from_finish_reason(candidate.finish_reason.as_ref(), has_tool_calls)
+    }
+}
+
 impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<GenerateContentResponse> {
     type Error = CompletionError;
 
@@ -454,11 +497,22 @@ impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<Generat
         {
             return Err(err);
         }
+        let has_tool_calls = candidate.content.as_ref().is_some_and(|content| {
+            content
+                .parts
+                .iter()
+                .any(|part| matches!(&part.part, PartKind::FunctionCall(_)))
+        });
+        let terminal_metadata =
+            terminal_metadata_from_finish_reason(candidate.finish_reason.as_ref(), has_tool_calls);
+        let allows_empty_choice = terminal_metadata.as_ref().is_some_and(|metadata| {
+            metadata.reason() == completion::CompletionFinishReason::ContentFilter
+        });
 
-        let content = candidate
-            .content
-            .as_ref()
-            .ok_or_else(|| {
+        let parts = match candidate.content.as_ref() {
+            Some(content) => content.parts.as_slice(),
+            None if allows_empty_choice => &[],
+            None => {
                 let reason = candidate
                     .finish_reason
                     .as_ref()
@@ -468,11 +522,13 @@ impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<Generat
                     .finish_message
                     .as_deref()
                     .unwrap_or("no finish message provided");
-                CompletionError::ResponseError(format!(
+                return Err(CompletionError::ResponseError(format!(
                     "Gemini candidate missing content ({reason}, finish_message={message})"
-                ))
-            })?
-            .parts
+                )));
+            }
+        };
+
+        let content = parts
             .iter()
             .map(
                 |Part {
@@ -538,11 +594,17 @@ impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<Generat
             )
             .collect::<Result<Vec<_>, _>>()?;
 
-        let choice = OneOrMany::many(content).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
-            )
-        })?;
+        let choice = match OneOrMany::many(content) {
+            Ok(choice) => choice,
+            Err(_) if allows_empty_choice => {
+                OneOrMany::one(completion::AssistantContent::text(String::new()))
+            }
+            Err(_) => {
+                return Err(CompletionError::ResponseError(
+                    "Response contained no message or tool call (empty)".to_owned(),
+                ));
+            }
+        };
 
         let usage = response
             .usage_metadata
@@ -1497,7 +1559,7 @@ pub mod gemini_api_types {
         ProhibitedContent,
     }
 
-    #[derive(Clone, Debug, Deserialize, Serialize)]
+    #[derive(Clone, Debug, Serialize)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum FinishReason {
         /// Default value. This value is unused.
@@ -1530,6 +1592,94 @@ pub mod gemini_api_types {
         TooManyToolCalls,
         /// The provider could not parse the generated response into a valid protocol shape.
         MalformedResponse,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    enum RawFinishReason {
+        FinishReasonUnspecified,
+        Stop,
+        MaxTokens,
+        Safety,
+        Recitation,
+        Language,
+        Other,
+        Blocklist,
+        ProhibitedContent,
+        Spii,
+        MalformedFunctionCall,
+        UnexpectedToolCall,
+        MissingThoughtSignature,
+        TooManyToolCalls,
+        MalformedResponse,
+        ImageSafety,
+        ImageProhibitedContent,
+        ImageOther,
+        NoImage,
+        ImageRecitation,
+        Escalation,
+        #[serde(other)]
+        Unknown,
+    }
+
+    impl From<RawFinishReason> for FinishReason {
+        fn from(reason: RawFinishReason) -> Self {
+            match reason {
+                RawFinishReason::FinishReasonUnspecified => Self::FinishReasonUnspecified,
+                RawFinishReason::Stop => Self::Stop,
+                RawFinishReason::MaxTokens => Self::MaxTokens,
+                RawFinishReason::Safety
+                | RawFinishReason::ImageSafety
+                | RawFinishReason::Escalation => Self::Safety,
+                RawFinishReason::Recitation | RawFinishReason::ImageRecitation => Self::Recitation,
+                RawFinishReason::Language => Self::Language,
+                RawFinishReason::Other
+                | RawFinishReason::ImageOther
+                | RawFinishReason::NoImage
+                | RawFinishReason::Unknown => Self::Other,
+                RawFinishReason::Blocklist => Self::Blocklist,
+                RawFinishReason::ProhibitedContent | RawFinishReason::ImageProhibitedContent => {
+                    Self::ProhibitedContent
+                }
+                RawFinishReason::Spii => Self::Spii,
+                RawFinishReason::MalformedFunctionCall => Self::MalformedFunctionCall,
+                RawFinishReason::UnexpectedToolCall => Self::UnexpectedToolCall,
+                RawFinishReason::MissingThoughtSignature => Self::MissingThoughtSignature,
+                RawFinishReason::TooManyToolCalls => Self::TooManyToolCalls,
+                RawFinishReason::MalformedResponse => Self::MalformedResponse,
+            }
+        }
+    }
+
+    impl FinishReason {
+        pub(crate) fn as_raw_reason(&self) -> &str {
+            match self {
+                Self::FinishReasonUnspecified => "FINISH_REASON_UNSPECIFIED",
+                Self::Stop => "STOP",
+                Self::MaxTokens => "MAX_TOKENS",
+                Self::Safety => "SAFETY",
+                Self::Recitation => "RECITATION",
+                Self::Language => "LANGUAGE",
+                Self::Other => "OTHER",
+                Self::Blocklist => "BLOCKLIST",
+                Self::ProhibitedContent => "PROHIBITED_CONTENT",
+                Self::Spii => "SPII",
+                Self::MalformedFunctionCall => "MALFORMED_FUNCTION_CALL",
+                Self::UnexpectedToolCall => "UNEXPECTED_TOOL_CALL",
+                Self::MissingThoughtSignature => "MISSING_THOUGHT_SIGNATURE",
+                Self::TooManyToolCalls => "TOO_MANY_TOOL_CALLS",
+                Self::MalformedResponse => "MALFORMED_RESPONSE",
+            }
+        }
+    }
+
+    impl<'de> Deserialize<'de> for FinishReason {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            RawFinishReason::deserialize(deserializer).map(Into::into)
+        }
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2238,6 +2388,113 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn request_with_additional_params(additional_params: serde_json::Value) -> CompletionRequest {
+        CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: crate::OneOrMany::one("Hello".into()),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: Some(additional_params),
+            output_schema: None,
+            record_telemetry_content: false,
+        }
+    }
+
+    #[test]
+    fn finish_reason_keeps_v041_variant_shapes() {
+        let reasons = [
+            FinishReason::FinishReasonUnspecified,
+            FinishReason::Stop,
+            FinishReason::MaxTokens,
+            FinishReason::Safety,
+            FinishReason::Recitation,
+            FinishReason::Language,
+            FinishReason::Other,
+            FinishReason::Blocklist,
+            FinishReason::ProhibitedContent,
+            FinishReason::Spii,
+            FinishReason::MalformedFunctionCall,
+            FinishReason::UnexpectedToolCall,
+            FinishReason::MissingThoughtSignature,
+            FinishReason::TooManyToolCalls,
+            FinishReason::MalformedResponse,
+        ];
+
+        for reason in reasons {
+            let raw = match reason {
+                FinishReason::FinishReasonUnspecified => "FINISH_REASON_UNSPECIFIED",
+                FinishReason::Stop => "STOP",
+                FinishReason::MaxTokens => "MAX_TOKENS",
+                FinishReason::Safety => "SAFETY",
+                FinishReason::Recitation => "RECITATION",
+                FinishReason::Language => "LANGUAGE",
+                FinishReason::Other => "OTHER",
+                FinishReason::Blocklist => "BLOCKLIST",
+                FinishReason::ProhibitedContent => "PROHIBITED_CONTENT",
+                FinishReason::Spii => "SPII",
+                FinishReason::MalformedFunctionCall => "MALFORMED_FUNCTION_CALL",
+                FinishReason::UnexpectedToolCall => "UNEXPECTED_TOOL_CALL",
+                FinishReason::MissingThoughtSignature => "MISSING_THOUGHT_SIGNATURE",
+                FinishReason::TooManyToolCalls => "TOO_MANY_TOOL_CALLS",
+                FinishReason::MalformedResponse => "MALFORMED_RESPONSE",
+            };
+
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(raw));
+        }
+    }
+
+    #[test]
+    fn new_finish_reasons_map_to_v041_categories() {
+        for (raw, expected) in [
+            ("IMAGE_SAFETY", "SAFETY"),
+            ("IMAGE_PROHIBITED_CONTENT", "PROHIBITED_CONTENT"),
+            ("IMAGE_RECITATION", "RECITATION"),
+            ("ESCALATION", "SAFETY"),
+            ("IMAGE_OTHER", "OTHER"),
+            ("NO_IMAGE", "OTHER"),
+            ("FUTURE_PROVIDER_REASON", "OTHER"),
+        ] {
+            let reason: FinishReason = serde_json::from_value(json!(raw)).unwrap();
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(expected));
+        }
+    }
+
+    #[test]
+    fn test_parallel_tool_calls_is_not_forwarded_to_gemini() {
+        let request = request_with_additional_params(json!({
+            "parallel_tool_calls": true,
+            "sentinel": "keep"
+        }));
+
+        let body = create_request_body(request).expect("request should convert");
+        let body = serde_json::to_value(body).expect("request body should serialize");
+
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert_eq!(body["sentinel"], "keep");
+    }
+
+    #[test]
+    fn test_invalid_parallel_tool_calls_is_rejected() {
+        let request = request_with_additional_params(json!({
+            "parallel_tool_calls": "invalid",
+            "sentinel": "keep"
+        }));
+
+        let error = create_request_body(request)
+            .expect_err("a non-boolean parallel tool control must be rejected");
+
+        assert!(matches!(error, CompletionError::RequestError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("additional_params.parallel_tool_calls must be a boolean")
+        );
+    }
+
     #[test]
     fn test_usage_metadata_deserializes_without_total_token_count() {
         // Gemini's proto3-JSON encoding omits fields whose value is the default (0),
@@ -2323,6 +2580,72 @@ mod tests {
         let error = completion::CompletionResponse::try_from(response)
             .expect_err("empty candidates should become a response error");
         assert!(error.to_string().contains("No response candidates"));
+    }
+
+    #[test]
+    fn test_safety_filtered_empty_response_remains_successful() {
+        let response: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "finishReason": "SAFETY"
+            }]
+        }))
+        .expect("safety-filtered response should deserialize");
+
+        let converted = completion::CompletionResponse::try_from(response)
+            .expect("safety-filtered empty response should remain successful");
+
+        assert!(matches!(
+            converted.choice.first(),
+            completion::AssistantContent::Text(text) if text.text.is_empty()
+        ));
+
+        let response: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "finishReason": "STOP"
+            }]
+        }))
+        .expect("empty stop response should deserialize");
+
+        let error = completion::CompletionResponse::try_from(response)
+            .expect_err("non-filter empty response should remain an error");
+        assert!(error.to_string().contains("candidate missing content"));
+    }
+
+    #[test]
+    fn new_filter_finish_reasons_allow_empty_responses() {
+        for finish_reason in [
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_RECITATION",
+            "ESCALATION",
+        ] {
+            let response: GenerateContentResponse = serde_json::from_value(json!({
+                "candidates": [{
+                    "finishReason": finish_reason
+                }]
+            }))
+            .expect("filtered response should deserialize");
+
+            let converted = completion::CompletionResponse::try_from(response)
+                .expect("filtered empty response should remain successful");
+            assert!(matches!(
+                converted.choice.first(),
+                completion::AssistantContent::Text(text) if text.text.is_empty()
+            ));
+        }
+
+        for finish_reason in ["IMAGE_OTHER", "NO_IMAGE", "FUTURE_PROVIDER_REASON"] {
+            let response: GenerateContentResponse = serde_json::from_value(json!({
+                "candidates": [{
+                    "finishReason": finish_reason
+                }]
+            }))
+            .expect("unfiltered response should deserialize");
+
+            let error = completion::CompletionResponse::try_from(response)
+                .expect_err("unfiltered empty response should remain an error");
+            assert!(error.to_string().contains("candidate missing content"));
+        }
     }
 
     #[test]

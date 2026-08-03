@@ -564,6 +564,7 @@ fn assistant_content_from_output(
             Ok(Some(completion::AssistantContent::Reasoning(Reasoning {
                 id: None,
                 content: reasoning_content,
+                additional_params: None,
             })))
         }
         Content::Image(ImageContent {
@@ -2018,7 +2019,8 @@ pub mod interactions_api_types {
                     let mut signature = None;
                     let summary = content
                         .into_iter()
-                        .map(|reasoning_content| {
+                        .filter_map(|reasoning_content| {
+                            let reasoning_content = reasoning_content.into_provider_content()?;
                             let text = match reasoning_content {
                                 message::ReasoningContent::Text {
                                     text,
@@ -2032,12 +2034,13 @@ pub mod interactions_api_types {
                                 message::ReasoningContent::Summary(text)
                                 | message::ReasoningContent::Encrypted(text) => text,
                                 message::ReasoningContent::Redacted { data } => data,
+                                message::ReasoningContent::ProviderData { .. } => return None,
                             };
 
-                            ThoughtSummaryContent::Text(TextContent {
+                            Some(ThoughtSummaryContent::Text(TextContent {
                                 text,
                                 annotations: None,
-                            })
+                            }))
                         })
                         .collect();
 

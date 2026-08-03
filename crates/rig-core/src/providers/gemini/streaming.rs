@@ -10,6 +10,7 @@ use super::completion::gemini_api_types::{
 use super::completion::{
     CompletionModel, create_request_body, function_call_finish_reason_error,
     normalized_token_usage, resolve_request_model, streaming_endpoint,
+    terminal_metadata_from_finish_reason,
 };
 use crate::completion::message::ReasoningContent;
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
@@ -137,6 +138,7 @@ where
             let mut final_finish_reason: Option<FinishReason> = None;
             let mut final_finish_message: Option<String> = None;
             let mut final_model_version: Option<String> = None;
+            let mut saw_tool_call = false;
             let mut stream_failed = false;
             while let Some(event_result) = event_source.next().await {
                 match event_result {
@@ -148,6 +150,9 @@ where
                         // Skip heartbeat messages or empty data
                         if message.data.trim().is_empty() {
                             continue;
+                        }
+                        if message.data == "[DONE]" {
+                            break;
                         }
 
                         let data = match serde_json::from_str::<StreamGenerateContentResponse>(&message.data) {
@@ -221,18 +226,20 @@ where
                                             // thinking block; emit a full Reasoning so the
                                             // core accumulator captures the signature for
                                             // Gemini 3+ roundtrip.
-                                            yield Ok(streaming::RawStreamingChoice::Reasoning {
+                                            yield Ok(streaming::InternalStreamingChoice::Raw(
+                                                streaming::RawStreamingChoice::Reasoning {
                                                 id: None,
                                                 content: ReasoningContent::Text {
                                                     text,
                                                     signature: thought_signature,
                                                 },
-                                            });
+                                            }));
                                         } else {
-                                            yield Ok(streaming::RawStreamingChoice::ReasoningDelta {
+                                            yield Ok(streaming::InternalStreamingChoice::Raw(
+                                                streaming::RawStreamingChoice::ReasoningDelta {
                                                 id: None,
                                                 reasoning: text,
-                                            });
+                                            }));
                                         }
                                     }
                                 },
@@ -241,7 +248,9 @@ where
                                     ..
                                 } => {
                                     if !text.is_empty() {
-                                        yield Ok(streaming::RawStreamingChoice::Message(text));
+                                        yield Ok(streaming::InternalStreamingChoice::Raw(
+                                            streaming::RawStreamingChoice::Message(text)
+                                        ));
                                     }
                                 },
                                 Part {
@@ -249,6 +258,7 @@ where
                                     thought_signature,
                                     ..
                                 } => {
+                                    saw_tool_call = true;
                                     let tool_call = streaming::RawStreamingToolCall::new(
                                         function_call.name.clone(),
                                         function_call.name,
@@ -260,8 +270,8 @@ where
                                     } else {
                                         tool_call
                                     };
-                                    yield Ok(streaming::RawStreamingChoice::ToolCall(
-                                        tool_call
+                                    yield Ok(streaming::InternalStreamingChoice::Raw(
+                                        streaming::RawStreamingChoice::ToolCall(tool_call)
                                     ));
                                 },
                                 part => {
@@ -290,19 +300,36 @@ where
             // Ensure event source is closed when stream ends
             event_source.close();
 
-            if !stream_failed {
-                yield Ok(streaming::RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
+            if stream_failed {
+                return;
+            }
+
+            let Some(finish_reason) = final_finish_reason else {
+                yield Err(CompletionError::ResponseError(
+                    "Gemini stream ended without a terminal finish_reason".to_owned(),
+                ));
+                return;
+            };
+            let terminal_metadata =
+                terminal_metadata_from_finish_reason(Some(&finish_reason), saw_tool_call);
+
+            yield Ok(streaming::InternalStreamingChoice::Final {
+                response: StreamingCompletionResponse {
                     usage_metadata: final_usage.unwrap_or_default(),
-                    finish_reason: final_finish_reason,
+                    finish_reason: Some(finish_reason),
                     finish_message: final_finish_message,
                     model_version: final_model_version,
-                }));
-            }
+                },
+                sidecar: streaming::StreamingFinalSidecar {
+                    terminal_metadata,
+                    normalized_usage: None,
+                },
+            });
         }.instrument(span);
 
-        Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
-            stream,
-        )))
+        Ok(streaming::StreamingCompletionResponse::stream_internal(
+            Box::pin(stream),
+        ))
     }
 }
 
